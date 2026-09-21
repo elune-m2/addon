@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "elune_m2"
+version = "1.9.1"
+name = "Elune M2"
+tagline = "Import and re-export World of Warcraft M2 models with per-expansion parsers"
+maintainer = "Lila"
+type = "add-on"
+
+tags = ["Import-Export", "3D View"]
+
+blender_version_min = "5.0.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+# This add-on only reads local files chosen by the user and creates Blender
+# data. It needs no network or extra permissions.
