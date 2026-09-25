@@ -274,8 +274,9 @@ class BaseM2Parser:
             self.model.bounding_min = (r.f32(), r.f32(), r.f32())  # bounding_box min
             self.model.bounding_max = (r.f32(), r.f32(), r.f32())  # bounding_box max
             self.model.bounding_radius = r.f32()   # bounding_sphere_radius
-            r.skip(24)                   # collision_box (CAaBox)
-            r.f32()                      # collision_sphere_radius
+            self.model.collision_min = (r.f32(), r.f32(), r.f32())  # collision_box
+            self.model.collision_max = (r.f32(), r.f32(), r.f32())
+            self.model.collision_radius = r.f32()  # collision_sphere_radius
             r.m2array()                  # collisionIndices
             r.m2array()                  # collisionPositions
             r.m2array()                  # collisionFaceNormals
@@ -432,6 +433,10 @@ class BaseM2Parser:
                 s.blend_time_out = r.u16()
             # variationNext (the linked list to the next variation) sits near
             if not legacy:
+                r.seek(start_pos + 32)
+                bmin = (r.f32(), r.f32(), r.f32())
+                bmax = (r.f32(), r.f32(), r.f32())
+                s.bounds = (bmin, bmax, r.f32())
                 r.seek(start_pos + size - 4)
                 s.variation_next = r.i16()
                 s.alias_next = r.u16()

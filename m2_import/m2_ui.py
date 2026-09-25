@@ -25,11 +25,18 @@ TEXTURE_TYPE_ITEMS = [
     ("12", "Monster Skin 2",     "Creature skin slot 2"),
     ("13", "Monster Skin 3",     "Creature skin slot 3"),
     ("14", "Item Icon",          "Item icon texture"),
-    ("15", "Guild Background",   "Guild tabard background"),
-    ("16", "Guild Emblem",       "Guild tabard emblem"),
-    ("17", "Guild Border",       "Guild tabard border"),
-    ("18", "Guild Emblem Flags", "Guild emblem flags / accessory slot"),
-    ("19", "Accessory / Slot 19", "Character accessory (nightelf hair leaves, etc.)"),
+    ("15", "Guild Background Color", "Guild tabard background colour (Cata+)"),
+    ("16", "Guild Emblem Color", "Guild tabard emblem colour (Cata+)"),
+    ("17", "Guild Border Color", "Guild tabard border colour (Cata+)"),
+    ("18", "Guild Emblem",       "Guild tabard emblem (Cata+)"),
+    ("19", "Character Eyes",     "Eye texture chosen by the eye-colour customization (Shadowlands+)"),
+    ("20", "Character Jewelry",  "Accessory / jewelry texture from customization (Shadowlands+)"),
+    ("21", "Character Secondary Skin", "Second skin layer from customization (Shadowlands+)"),
+    ("22", "Character Secondary Hair", "Second hair layer from customization (Shadowlands+)"),
+    ("23", "Character Secondary Armor", "Second armor layer from customization (Shadowlands+)"),
+    ("24", "Type 24",            "Shadowlands+ customization slot (undocumented)"),
+    ("25", "Type 25",            "Seen on Dracthyr (10.0+), undocumented"),
+    ("26", "Type 26",            "Seen on Dracthyr (10.0+), undocumented"),
 ]
 
 BLEND_MODE_ITEMS = [
@@ -70,9 +77,26 @@ def _sync_material(mat):
             del mat["m2_auto_imported"]
         except Exception:  # noqa: BLE001
             mat["m2_auto_imported"] = 0
-    mat["m2_texture_types"] = str(int(p.texture_type))
+    # A material can draw several texture layers (retail eyes and eye glow use
+    # two, tabards six). The panel edits the first, and layer 2 when present;
+    # any further layers are kept exactly as imported.
+    types = _csv_list(mat.get("m2_texture_types"))
+    ids = _csv_list(mat.get("m2_texture_ids"))
+    n = max(len(types), len(ids), 1)
+    types = (types + ["0"] * n)[:n]
+    ids = (ids + ["0"] * n)[:n]
+    types[0] = str(int(p.texture_type))
+    ids[0] = str(int(p.texture_id)) if p.texture_type == "0" else "0"
+    if p.layer2_enabled:
+        if n < 2:
+            types.append("0"); ids.append("0"); n = 2
+        types[1] = str(int(p.layer2_type))
+        ids[1] = str(int(p.layer2_id)) if p.layer2_type == "0" else "0"
+    elif n >= 2 and p.layer2_seen:
+        types, ids = types[:1], ids[:1]            # user removed the second layer
+    mat["m2_texture_types"] = ",".join(types)
+    mat["m2_texture_ids"] = ",".join(ids)
     if p.texture_type == "0":
-        mat["m2_texture_ids"] = str(int(p.texture_id))
         # Hardcode a texture file path (baked into the M2's inline
         # texture record so the client loads the .blp by path — no FID
         # lookup needed). Absolute or //-relative to the .blend; the
@@ -107,6 +131,10 @@ def _sync_material(mat):
 
 
 SUPPRESS_MATERIAL_UPDATE = False
+
+
+def _csv_list(value):
+    return [p.strip() for p in str(value or "").split(",") if p.strip()]
 
 
 def _on_material_update(self, context):
@@ -161,6 +189,18 @@ def sync_props_from_customprops(mat):
         raw_path = mat.get("m2_texture_paths")
         if raw_path is not None:
             p.texture_path = str(raw_path)
+        # Second texture layer, when the material has one.
+        types = _csv_list(mat.get("m2_texture_types"))
+        ids = _csv_list(mat.get("m2_texture_ids"))
+        has2 = len(types) >= 2 or len(ids) >= 2
+        p.layer2_enabled = has2
+        p.layer2_seen = has2
+        if has2:
+            t2 = types[1] if len(types) >= 2 else "0"
+            p.layer2_type = t2 if t2 in _TEXTURE_TYPE_ENUM_VALUES else "0"
+            i2 = ids[1] if len(ids) >= 2 else "0"
+            p.layer2_id = int(i2) if i2.lstrip("-").isdigit() else 0
+        p.extra_layers = max(0, max(len(types), len(ids)) - 2)
         # Blend: accept int or already-token string.
         bm = mat.get("m2_blend_mode")
         if isinstance(bm, str):
@@ -203,6 +243,18 @@ class M2MaterialProps(PropertyGroup):
                      "the client loads this exact file. Leave empty to use the "
                      "FileDataID field instead."),
         default="", subtype="FILE_PATH", update=_on_material_update)
+    layer2_enabled: BoolProperty(
+        name="Second Texture Layer", default=False,
+        description="Draw a second texture with this material (eyes and eye glow use two "
+                    "layers of the same texture with a multi-layer Shader ID)",
+        update=_on_material_update)
+    layer2_seen: BoolProperty(default=False)
+    layer2_type: EnumProperty(
+        name="Layer 2 Type", items=TEXTURE_TYPE_ITEMS, default="0",
+        update=_on_material_update)
+    layer2_id: IntProperty(
+        name="Layer 2 FileDataID", min=0, default=0, update=_on_material_update)
+    extra_layers: IntProperty(default=0)
     blend_mode: EnumProperty(
         name="Blend", items=BLEND_MODE_ITEMS, default="OPAQUE",
         update=_on_material_update)
@@ -375,6 +427,14 @@ class VIEW3D_PT_m2_material(_M2PanelBase, Panel):
             if p.texture_path:
                 col.label(text="Path overrides FileDataID on export",
                           icon="INFO")
+        col.prop(p, "layer2_enabled")
+        if p.layer2_enabled:
+            sub = col.column(align=True)
+            sub.prop(p, "layer2_type", text="Layer 2")
+            if p.layer2_type == "0":
+                sub.prop(p, "layer2_id")
+        if p.extra_layers:
+            col.label(text="+%d more layer(s) kept from the import" % p.extra_layers, icon="INFO")
         col.prop(p, "blend_mode")
         col.prop(p, "transparency", slider=True)
         col.prop(p, "shader_id")

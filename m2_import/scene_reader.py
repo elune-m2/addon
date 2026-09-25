@@ -105,6 +105,16 @@ def _meta_from_source(source_m2, fps):
     return out
 
 
+def _restore_bounds(model, meta):
+    b = (meta or {}).get("bounds") or {}
+    if "bbox" in b:
+        model.bounding_min, model.bounding_max = tuple(b["bbox"][0]), tuple(b["bbox"][1])
+        model.bounding_radius = float(b["bbox"][2])
+    if "collision" in b:
+        model.collision_min, model.collision_max = tuple(b["collision"][0]), tuple(b["collision"][1])
+        model.collision_radius = float(b["collision"][2])
+
+
 def read_scene(objects, mirror_x=False, source_m2="", fps=30.0, tried=()):
     """Build an M2Model from the given Blender objects (e.g. a collection)."""
     objects = list(objects)
@@ -174,6 +184,9 @@ def read_scene(objects, mirror_x=False, source_m2="", fps=30.0, tried=()):
         seq.movespeed = float(s.get("movespeed", 0.0))
         seq.blend_time_in = int(s.get("blend_in", 150))
         seq.blend_time_out = int(s.get("blend_out", 0))
+        b = s.get("bounds")
+        if b:
+            seq.bounds = (tuple(b[0]), tuple(b[1]), float(b[2]))
         sequences.append(seq)
     model.sequences = sequences
     nseq = len(sequences)
@@ -183,7 +196,9 @@ def read_scene(objects, mirror_x=False, source_m2="", fps=30.0, tried=()):
     _read_animations(model, objects, nseq, fps, mirror_x)
     _read_attachments(model, meta)
     _read_geometry(model, objects, meta, mirror_x)
-    from .from_scene import bounds_override_from_objects
+    from .from_scene import bounds_override_from_objects, is_helper_box
+    _restore_bounds(model, meta)
+    model.collision_override = bounds_override_from_objects(objects, mirror_x, "m2_collision_box")
     model.bounding_override = bounds_override_from_objects(objects, mirror_x)
     if model.bounding_override:
         print("[M2] using edited bounding box from 'M2_BoundingBox' object",
@@ -399,7 +414,7 @@ def _read_geometry(model, objects, meta, mirror_x):
         return (gid, original, o.name)
 
     geosets = sorted((o for o in objects
-                      if o.type == "MESH" and not o.get("m2_bounding_box")),
+                      if o.type == "MESH" and not is_helper_box(o)),
                      key=_order_key)
 
     vertices = []        # global M2Vertex list
@@ -428,6 +443,7 @@ def _read_geometry(model, objects, meta, mirror_x):
 
         # per-vertex UV and normal (take the first loop touching each vertex)
         uv_layer = mesh.uv_layers.active
+        uv2_layer = mesh.uv_layers.get("UVMap2")
         vert_loop = [-1] * len(mesh.vertices)
         for loop in mesh.loops:
             if vert_loop[loop.vertex_index] < 0:
@@ -442,6 +458,9 @@ def _read_geometry(model, objects, meta, mirror_x):
             if uv_layer is not None and ln >= 0:
                 u, vv = uv_layer.data[ln].uv
                 v.uv1 = (u, 1.0 - vv)
+            if uv2_layer is not None and ln >= 0:
+                u2, vv2 = uv2_layer.data[ln].uv
+                v.uv2 = (u2, 1.0 - vv2)
             if corner_normals is not None and ln >= 0:
                 n = nmat @ Vector(corner_normals[ln])
                 n.normalize()

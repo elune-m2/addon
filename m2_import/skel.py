@@ -49,6 +49,11 @@ def _read_sequences(reader, arr, data_len):
         r.u32(); r.u32()         # replay range
         s.blend_time_in = r.u16()
         s.blend_time_out = r.u16()
+        bmin = (r.f32(), r.f32(), r.f32())
+        bmax = (r.f32(), r.f32(), r.f32())
+        s.bounds = (bmin, bmax, r.f32())
+        s.variation_next = r.i16()
+        s.alias_next = r.u16()
         r.seek(start + _SEQUENCE_SIZE)
         return s
 

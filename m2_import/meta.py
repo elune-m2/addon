@@ -25,6 +25,13 @@ def build(model, fps):
         "texture_file_ids": [texture_file_id(t) for t in model.textures],
         "aux_chunks": {name: base64.b64encode(raw).decode("ascii")
                        for name, raw in (model.aux_chunks or {}).items()},
+        "bounds": {
+            "bbox": [list(model.bounding_min or (0, 0, 0)), list(model.bounding_max or (0, 0, 0)),
+                     float(model.bounding_radius or 0.0)],
+            "collision": [list(model.collision_min or (0, 0, 0)),
+                          list(model.collision_max or (0, 0, 0)),
+                          float(model.collision_radius or 0.0)],
+        },
         "global_loops": list(model.global_loops),
         "seq_lookup": list(model.seq_lookup),
         "sequences": [
@@ -32,8 +39,11 @@ def build(model, fps):
              "dur": s.duration, "flags": s.flags,
              "movespeed": getattr(s, "movespeed", 0.0),
              "blend_in": getattr(s, "blend_time_in", 150),
-             "blend_out": getattr(s, "blend_time_out", 0)}
-            for s in model.sequences
+             "blend_out": getattr(s, "blend_time_out", 0),
+             "alias_next": int(getattr(s, "alias_next", i)),
+             "bounds": ([list(s.bounds[0]), list(s.bounds[1]), s.bounds[2]]
+                        if getattr(s, "bounds", None) else None)}
+            for i, s in enumerate(model.sequences)
         ],
         "textures": [
             {"type": t.type, "flags": t.flags, "filename": t.filename}

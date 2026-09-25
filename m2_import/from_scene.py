@@ -14,6 +14,7 @@ from .model import (
 )
 from .scene_reader import geoset_id_from_name
 from . import names
+from . import anim_data
 
 
 def _crc(name):
@@ -255,6 +256,13 @@ def _apply_blend(s, action, m=None):
         s.movespeed = float(action["m2_seq_movespeed"])
     elif "movespeed" in m:
         s.movespeed = float(m["movespeed"])
+    b = None
+    if action is not None and "m2_seq_bounds" in action.keys():
+        b = list(action["m2_seq_bounds"])
+    elif m.get("bounds"):
+        b = [*m["bounds"][0], *m["bounds"][1], m["bounds"][2]]
+    if b and len(b) == 7:
+        s.bounds = ((b[0], b[1], b[2]), (b[3], b[4], b[5]), float(b[6]))
 
 
 def _build_animation_multi(model, arm, ordered, idx, fps, mirror_x, meta):
@@ -273,6 +281,7 @@ def _build_animation_multi(model, arm, ordered, idx, fps, mirror_x, meta):
     # Keep the original order, but only emit sequences we actually have a clip
     kept = sorted(tagged)
     nseq = len(kept)
+    model._kept_sequences = kept
     sequences = []
     seq_f0 = {}          # sequence index -> first Blender frame of its clip
     for si in kept:
@@ -311,6 +320,27 @@ def _build_animation_multi(model, arm, ordered, idx, fps, mirror_x, meta):
         _fix_degenerate_duration(s)
         sequences.append(s)
     model.sequences = sequences
+
+    # Alias sequences (flag 0x40) play another sequence's keys through
+    # alias_next. Re-point each one at the output index of its stamped
+    # "<id>-<var>" target; everything else points at itself, as retail does.
+    key_to_idx = {}
+    for i, s in enumerate(sequences):
+        key_to_idx.setdefault("%d-%d" % (int(s.id), int(s.variation_index)), i)
+    kept_pos = {si: i for i, si in enumerate(kept)}
+    for i, si in enumerate(kept):
+        s = sequences[i]
+        action = tagged[si]
+        target = i
+        if "m2_seq_alias" in action.keys():
+            target = key_to_idx.get(str(action["m2_seq_alias"]), -1)
+        elif si < len(meta_seqs) and "alias_next" in meta_seqs[si]:
+            target = kept_pos.get(int(meta_seqs[si]["alias_next"]), -1)
+        if target < 0 or target == i:
+            # Nothing to borrow (target not exported): play as a plain clip.
+            s.flags &= ~0x40
+            target = i
+        s.alias_next = target
 
     # seq_lookup maps an animation id to its first sequence; reuse the original
     # when the sequence set came through whole, else rebuild it.
@@ -428,6 +458,7 @@ def _build_animation_named(model, arm, ordered, idx, fps, mirror_x):
                          int(action.get("m2_seq_duration", 0)))
         s.start_timestamp = 0
         s.end_timestamp = s.duration
+        s.alias_next = len(sequences)            # points at itself, like retail
         _apply_blend(s, action)
         _fix_degenerate_duration(s)
         sequences.append(s)
@@ -555,10 +586,17 @@ def _attachment_id(obj):
     return None
 
 
-def bounds_override_from_objects(objects, mirror_x):
-    """World-space AABB of the 'M2_BoundingBox' object, in WoW space, or None."""
-    box = next((o for o in objects
-                if o.type == "MESH" and o.get("m2_bounding_box")), None)
+HELPER_BOX_PROPS = ("m2_bounding_box", "m2_collision_box")
+
+
+def is_helper_box(obj):
+    """The editable render-bounds / collision-box objects: never geometry."""
+    return any(obj.get(p) for p in HELPER_BOX_PROPS)
+
+
+def bounds_override_from_objects(objects, mirror_x, prop="m2_bounding_box"):
+    """World-space AABB of the box object flagged with ``prop``, in WoW space, or None."""
+    box = next((o for o in objects if o.type == "MESH" and o.get(prop)), None)
     if box is None or not box.data.vertices:
         return None
     mw = box.matrix_world
@@ -597,12 +635,23 @@ def _build_cameras(model, objects, mirror_x):
         loc = cobj.matrix_world.translation
         c.position_base = wow((loc.x, loc.y, loc.z))
 
-        # Target: the constraint's target object, else a point 1 unit down -Z.
+        # Target: the aim constraint's target, on the camera or its rig empty;
+        # else a point 1 unit down -Z.
         target = None
-        for con in cobj.constraints:
-            if con.type in ("DAMPED_TRACK", "TRACK_TO") and con.target is not None:
-                target = con.target
+        holders = [cobj] + ([cobj.parent] if cobj.parent is not None else [])
+        for holder in holders:
+            for con in holder.constraints:
+                if con.type in ("DAMPED_TRACK", "TRACK_TO") and con.target is not None:
+                    target = con.target
+                    break
+            if target is not None:
                 break
+        if cobj.parent is not None and cobj.parent.get("m2_camera_rig"):
+            roll = float(cobj.rotation_euler.z)
+            if abs(roll) > 1e-6:
+                c.roll = M2AnimTrack()
+                c.roll.interpolation_type = 1
+                c.roll.timelines = [[(0, roll)]]
         if target is not None:
             t = target.matrix_world.translation
             c.target_base = wow((t.x, t.y, t.z))
@@ -883,7 +932,30 @@ class _MatSpec:
     """One Blender material resolved to the M2 tables it needs."""
     __slots__ = ("tex_ids", "tex_types", "tex_paths", "blend", "flags", "shader",
                  "layer", "material_index", "combo_index", "count", "origin",
-                 "transparency")
+                 "transparency", "batch_flags", "color", "coords", "transforms",
+                 "weights", "tex_flags")
+
+
+# M2Batch.flags retail writes on ordinary body batches ("static texture").
+DEFAULT_BATCH_FLAGS = 0x10
+NO_TRANSFORM = 0xFFFF
+# Global flags meaning "animation data lives outside the M2": 0x2000 (Legion
+# chunked .anim files), 0x100000 (skeleton .skel file) and 0x200000 (upgraded
+# format, chunked .anim). An export embeds its sequences, so these must be off.
+EXTERNAL_ANIM_FLAGS = 0x2000 | 0x100000 | 0x200000
+
+
+DEFAULT_TEXTURE_FLAGS = 0x3          # wrap U and V, what retail file textures carry
+
+
+def _spec_batch_defaults(spec, n):
+    spec.tex_flags = [DEFAULT_TEXTURE_FLAGS] * n
+    spec.batch_flags = DEFAULT_BATCH_FLAGS
+    spec.color = -1
+    spec.coords = list(range(n))          # layer k samples UV set k
+    spec.transforms = [NO_TRANSFORM] * n
+    spec.weights = [0] * n
+    return spec
 
 
 # Geoset GROUP (skin_section_id // 100) -> the texture type WoW conventionally
@@ -924,7 +996,8 @@ def geoset_material_map(source_model):
         spec = _MatSpec()
         spec.tex_ids = [t.file_data_id for t in texes]
         spec.tex_types = [t.type for t in texes]
-        spec.tex_paths = [t.filename or "" for t in texes]
+        spec.tex_paths = ["" if re.fullmatch(r"FileDataID_\d+", t.filename or "") else (t.filename or "")
+                          for t in texes]
         spec.count = len(texes)
         mi = b.material_index
         if 0 <= mi < len(source_model.materials):
@@ -936,6 +1009,18 @@ def geoset_material_map(source_model):
         spec.layer = b.material_layer
         spec.transparency = TRANSPARENCY_OPAQUE
         spec.origin = "source"
+        _spec_batch_defaults(spec, len(texes))
+        spec.tex_flags = [int(t.flags) for t in texes]
+        spec.batch_flags = int(b.flags)
+        spec.color = int(b.color_index)
+        for k in range(len(texes)):
+            ci, ti, wi = b.texture_coord_combo + k, b.texture_transform_combo + k, b.texture_weight_combo + k
+            spec.coords[k] = (int(source_model.tex_coord_combos[ci])
+                              if 0 <= ci < len(source_model.tex_coord_combos) else k)
+            if 0 <= ti < len(source_model.tex_transform_combos):
+                spec.transforms[k] = int(source_model.tex_transform_combos[ti])
+            if 0 <= wi < len(source_model.tex_weight_combos):
+                spec.weights[k] = int(source_model.tex_weight_combos[wi])
         out[gid] = spec
     return out
 
@@ -961,6 +1046,14 @@ def _copy_spec(src):
     spec.tex_ids = list(spec.tex_ids)
     spec.tex_types = list(spec.tex_types)
     spec.tex_paths = list(getattr(src, "tex_paths", ["" for _ in spec.tex_ids]))
+    _spec_batch_defaults(spec, len(spec.tex_ids))
+    for slot in ("batch_flags", "color"):
+        if getattr(src, slot, None) is not None:
+            setattr(spec, slot, getattr(src, slot))
+    for slot in ("coords", "transforms", "weights", "tex_flags"):
+        v = getattr(src, slot, None)
+        if v:
+            setattr(spec, slot, list(v))
     return spec
 
 
@@ -986,6 +1079,7 @@ def _autofill_spec(geoset_id, geoset_map, default_texture_id, character_style):
     spec.layer = 0
     spec.transparency = TRANSPARENCY_OPAQUE
     spec.origin = "convention" if ttype else "default"
+    _spec_batch_defaults(spec, 1)
     return spec
 
 
@@ -1012,6 +1106,8 @@ def _resolve_material(bmat, default_texture_id):
     raw_paths = str(bmat.get("m2_texture_paths", "") or "") if bmat is not None else ""
     if raw_paths:
         parts = [p.strip() for p in raw_paths.split(",")]
+        # "FileDataID_123" is the importer's display name, never a real path.
+        parts = ["" if re.fullmatch(r"FileDataID_\d+", p) else p for p in parts]
         spec.tex_paths = [parts[i] if i < len(parts) else ""
                           for i in range(len(ids))]
     else:
@@ -1026,6 +1122,19 @@ def _resolve_material(bmat, default_texture_id):
             and (bmat is None or bmat.get("m2_blend_mode") is None):
         spec.blend = BLEND_ALPHA
     spec.origin = "material"
+    _spec_batch_defaults(spec, len(ids))
+    if bmat is not None:
+        if bmat.get("m2_batch_flags") is not None:
+            spec.batch_flags = int(bmat["m2_batch_flags"])
+        if bmat.get("m2_color_index") is not None:
+            spec.color = int(bmat["m2_color_index"])
+        for slot, key, default in (("coords", "m2_texture_coords", 0),
+                                   ("transforms", "m2_texture_transforms", NO_TRANSFORM),
+                                   ("weights", "m2_texture_weights", 0),
+                                   ("tex_flags", "m2_texture_flags", DEFAULT_TEXTURE_FLAGS)):
+            vals = _ids_from(bmat.get(key))
+            if vals:
+                setattr(spec, slot, [vals[i] if i < len(vals) else default for i in range(len(ids))])
     return spec
 
 
@@ -1041,7 +1150,54 @@ def _has_real_texture(spec):
     return any(t == 0 and i for t, i in zip(spec.tex_types, spec.tex_ids))
 
 
-def _build_material_tables(model, meshes, default_texture_id, geoset_map=None):
+def _remap_track(track, kept):
+    """A copy of ``track`` whose per-sequence timelines follow the exported
+    sequence order (``kept`` = original index per exported sequence)."""
+    out = M2AnimTrack()
+    out.interpolation_type = track.interpolation_type
+    out.global_sequence = track.global_sequence
+    src = list(track.timelines or [])
+    if track.global_sequence >= 0 or kept is None:
+        out.timelines = [list(tl) for tl in src]
+    else:
+        out.timelines = [list(src[i]) if i < len(src) else [] for i in kept]
+    return out
+
+
+def _carry_tracks(model, specs, source_tracks):
+    """Copy the colour and texture-transform tracks the materials reference
+    from the source model, renumbering them; return the index maps."""
+    kept = getattr(model, "_kept_sequences", None)
+    if kept is None and model.sequences:
+        # Sequences were rebuilt from action names: per-sequence keys cannot be
+        # matched, but global-sequence tracks (the usual UV scroll) still can.
+        kept = []
+    colors_src = (source_tracks or {}).get("colors") or []
+    xforms_src = (source_tracks or {}).get("transforms") or []
+    color_map, xform_map = {}, {}
+    model.colors, model.transforms = [], []
+    for spec in specs:
+        c = getattr(spec, "color", -1)
+        if 0 <= c < len(colors_src) and c not in color_map:
+            color_map[c] = len(model.colors)
+            ct, at = colors_src[c]
+            model.colors.append((_remap_track(ct, kept), _remap_track(at, kept)))
+        for t in getattr(spec, "transforms", ()):
+            if 0 <= t < len(xforms_src) and t != NO_TRANSFORM and t not in xform_map:
+                xform_map[t] = len(model.transforms)
+                tr, rot, sc = xforms_src[t]
+                model.transforms.append((_remap_track(tr, kept), _remap_track(rot, kept),
+                                         _remap_track(sc, kept)))
+    model.n_colors = len(model.colors)
+    model.n_texture_transforms = len(model.transforms)
+    if model.transforms or model.colors:
+        print("[M2] carried %d texture transform(s) and %d colour track(s) from the source"
+              % (len(model.transforms), len(model.colors)), flush=True)
+    return color_map, xform_map
+
+
+def _build_material_tables(model, meshes, default_texture_id, geoset_map=None,
+                           source_tracks=None):
     """Build the texture / renderflag / combo tables for every mesh slot."""
     geoset_map = geoset_map or {}
     plan = {}          # (obj name, slot) -> _MatSpec
@@ -1090,6 +1246,9 @@ def _build_material_tables(model, meshes, default_texture_id, geoset_map=None):
     lookup = []
     coord, weight, transform = [], [], []
     weight_values, weight_key = [], {}   # distinct transparency -> weight track
+    color_map, xform_map = _carry_tracks(model, order, source_tracks)
+    for spec in order:
+        spec.color = color_map.get(getattr(spec, "color", -1), -1)
 
     for spec in order:
         # renderflags row (deduped)
@@ -1121,16 +1280,20 @@ def _build_material_tables(model, meshes, default_texture_id, geoset_map=None):
             # their own M2Texture rows — the client picks the row via
             # the batch's texture_combo_index so distinct rows can
             # legitimately point at different files.
-            tk = (ttype, fid, path)
+            tflags = getattr(spec, "tex_flags", None) or []
+            tflag = int(tflags[i]) if i < len(tflags) else DEFAULT_TEXTURE_FLAGS
+            tk = (ttype, fid, path, tflag)
             ti = tex_key.get(tk)
             if ti is None:
                 ti = len(textures)
                 tex_key[tk] = ti
-                textures.append(M2Texture(ttype, 0, path, fid))
+                textures.append(M2Texture(ttype, tflag, path, fid))
             lookup.append(ti)
-            coord.append(i)          # texture unit / UV set
+            coords = getattr(spec, "coords", None) or []
+            coord.append(int(coords[i]) if i < len(coords) else 0)   # UV set (0 = UVMap)
             weight.append(wi)        # this material's transparency track
-            transform.append(0xFFFF)  # no texture transform
+            xf = getattr(spec, "transforms", None) or []
+            transform.append(xform_map.get(xf[i], NO_TRANSFORM) if i < len(xf) else NO_TRANSFORM)
 
     model.textures = textures
     model.materials = materials
@@ -1138,9 +1301,15 @@ def _build_material_tables(model, meshes, default_texture_id, geoset_map=None):
     model.tex_coord_combos = coord
     model.tex_weight_combos = weight
     model.tex_transform_combos = transform
-    model.texture_indices_by_id = []
-    model.n_colors = 0
-    model.n_texture_transforms = 0
+    # textureIndicesById: texture type -> texture row. The client uses this
+    # lookup when it swaps replaceable textures in (skin, hair, character
+    # customization such as horns and blindfolds); without it those geosets
+    # render untextured. Retail lists every type up to the highest present,
+    # -1 where absent, and keeps the last row when a type repeats (type 0).
+    tii = [0xFFFF] * (max((int(t.type) for t in textures), default=-1) + 1)
+    for i, t in enumerate(textures):
+        tii[int(t.type)] = i
+    model.texture_indices_by_id = tii
     # Remember the transparency values so build_model_from_scene can emit one
     # weight track per value (keyframed for every sequence).
     model._weight_values = weight_values
@@ -1232,7 +1401,7 @@ def _evaluated_mesh(obj):
 def _build_mesh(model, objects, g2b, mirror_x, specs):
     """Vertices, triangles, submeshes and batches."""
     meshes = sorted((o for o in objects
-                     if o.type == "MESH" and not o.get("m2_bounding_box")),
+                     if o.type == "MESH" and not is_helper_box(o)),
                     key=lambda o: (_geoset_id_of(o), o.name))
     vertices = []
     skin_verts = []
@@ -1250,6 +1419,7 @@ def _build_mesh(model, objects, g2b, mirror_x, specs):
         mw = obj.matrix_world
         nmat = mw.to_3x3().inverted_safe().transposed()
         uv_layer = mesh.uv_layers.active
+        uv2_layer = mesh.uv_layers.get("UVMap2")     # second set for multi-layer materials
         g2b_obj = {}
         for gi, vg in enumerate(obj.vertex_groups):
             j = g2b.get(vg.name)
@@ -1292,9 +1462,15 @@ def _build_mesh(model, objects, g2b, mirror_x, specs):
                     uv = (u, 1.0 - vv)
                 else:
                     uv = (0.0, 0.0)
+                if uv2_layer is not None:
+                    u2, vv2 = uv2_layer.data[loop_index].uv
+                    uv2 = (u2, 1.0 - vv2)
+                else:
+                    uv2 = (0.0, 0.0)
                 key = (vert_index,
                        round(nrm.x, 4), round(nrm.y, 4), round(nrm.z, 4),
-                       round(uv[0], 5), round(uv[1], 5))
+                       round(uv[0], 5), round(uv[1], 5),
+                       round(uv2[0], 5), round(uv2[1], 5))
                 l = _cache.get(key)
                 if l is not None:
                     return l
@@ -1305,6 +1481,7 @@ def _build_mesh(model, objects, g2b, mirror_x, specs):
                 v.pos = (-co.x, co.y, co.z) if mirror_x else (co.x, co.y, co.z)
                 v.normal = (-nrm.x, nrm.y, nrm.z) if mirror_x else (nrm.x, nrm.y, nrm.z)
                 v.uv1 = uv
+                v.uv2 = uv2
                 v.bone_weights, v.bone_indices = _vertex_bones(mv, g2b_obj)
                 vertices.append(v)
                 skin_verts.append(len(skin_verts))
@@ -1330,10 +1507,11 @@ def _build_mesh(model, objects, g2b, mirror_x, specs):
                 spec = specs.get((None, 0)) or next(iter(specs.values()))
 
             b = M2Batch()
+            b.flags = int(getattr(spec, "batch_flags", DEFAULT_BATCH_FLAGS)) & 0xFF
             b.submesh_index = sub_index
             b.material_index = spec.material_index
             b.texture_combo_index = spec.combo_index
-            b.color_index = -1
+            b.color_index = int(getattr(spec, "color", -1))
             b.shader_id = spec.shader
             b.material_layer = spec.layer
             b.texture_count = spec.count
@@ -1406,12 +1584,27 @@ def build_model_from_scene(objects, fps=30, mirror_x=False, texture_file_id=0,
     # Textures / renderflags / combo tables come from the Blender materials, so
     # a multi-material model exports with its real blend modes and shaders.
     meshes = [o for o in objects
-              if o.type == "MESH" and not o.get("m2_bounding_box")]
+              if o.type == "MESH" and not is_helper_box(o)]
     geoset_map = geoset_material_map(source_model) if source_model else {}
     if geoset_map:
         print("[M2] source M2 supplies material data for %d geoset id(s)"
               % len(geoset_map), flush=True)
-    specs = _build_material_tables(model, meshes, texture_file_id, geoset_map)
+    if source_model is not None:
+        # Keep the source's global flags (0x80 is what the glow shaders rely
+        # on) but drop every "animation data lives outside the M2" bit: 0x2000
+        # (Legion chunked .anim), 0x200000 (upgraded-format chunked .anim) and
+        # 0x100000 (skeleton .skel file). Our sequences are embedded; with those
+        # bits set the client looks for external tracks and crashes on a null
+        # pointer while loading the model (character select, "ERROR #132").
+        model.global_flags = (int(source_model.global_flags) & ~EXTERNAL_ANIM_FLAGS) | 0x80
+        source_tracks = {"colors": list(source_model.colors), "transforms": list(source_model.transforms)}
+    else:
+        source_tracks = {"colors": [(anim_data.track_from_json(c), anim_data.track_from_json(a))
+                                    for c, a in (meta or {}).get("colors", [])],
+                         "transforms": [(anim_data.track_from_json(t), anim_data.track_from_json(r),
+                                         anim_data.track_from_json(s))
+                                        for t, r, s in (meta or {}).get("transforms", [])]}
+    specs = _build_material_tables(model, meshes, texture_file_id, geoset_map, source_tracks)
     _build_mesh(model, objects, g2b, mirror_x, specs)
 
     nseq = max(1, len(model.sequences))
@@ -1427,6 +1620,20 @@ def build_model_from_scene(objects, fps=30, mirror_x=False, texture_file_id=0,
     _build_cameras(model, objects, mirror_x)
     _build_events(model, objects, arm, mirror_x, source_model)
 
+    if source_model is not None:
+        model.bounding_min, model.bounding_max = source_model.bounding_min, source_model.bounding_max
+        model.bounding_radius = source_model.bounding_radius
+        model.collision_min, model.collision_max = source_model.collision_min, source_model.collision_max
+        model.collision_radius = source_model.collision_radius
+    else:
+        meta_b = (_find_meta(objects) or {}).get("bounds") or {}
+        if "bbox" in meta_b:
+            model.bounding_min, model.bounding_max = tuple(meta_b["bbox"][0]), tuple(meta_b["bbox"][1])
+            model.bounding_radius = float(meta_b["bbox"][2])
+        if "collision" in meta_b:
+            model.collision_min, model.collision_max = tuple(meta_b["collision"][0]), tuple(meta_b["collision"][1])
+            model.collision_radius = float(meta_b["collision"][2])
+    model.collision_override = bounds_override_from_objects(objects, mirror_x, "m2_collision_box")
     model.bounding_override = bounds_override_from_objects(objects, mirror_x)
     if model.bounding_override:
         print("[M2] using edited bounding box from 'M2_BoundingBox' object",

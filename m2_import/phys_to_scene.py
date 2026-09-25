@@ -1,429 +1,369 @@
-"""Rebuild Blender's rigid-body world from a .phys file.
+"""Build a Blender physics rig from .phys data.
 
-Inverse of `phys_from_scene`. On import we look for a `<name>.phys`
-sibling next to the .m2 and, if found, materialize each Body as a
-primitive (cube/sphere/cylinder — matching its shape) parented to the
-right bone, then wire up Rigid Body settings and constraint empties for
-each Joint. The user can then tweak shapes/joints in Blender and
-re-export to a byte-similar .phys.
+Sources, in priority order: an explicit file, the M2's embedded PFDC chunk
+(what modern retail models use), a ``<name>.phys`` sibling, or the only .phys
+in the folder.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import bpy
 from mathutils import Matrix, Vector
 
-from . import phys
+from . import phys, phys_rig
 
 
-_PHYS_COLLECTION_SUFFIX = "_phys"
-
-
-def _bone_name_by_m2_index(arm_obj) -> List[str]:
-    """M2-index → bone name. Same topological order as the exporter."""
+def _bone_names(arm_obj) -> List[str]:
+    """M2 bone index -> bone name, in the exporter's order."""
     from . import from_scene
     return [b.name for b in from_scene._topo_bones(arm_obj.data)]
 
 
-def _ensure_phys_collection(context, name: str):
-    scene = context.scene
-    coll_name = name + _PHYS_COLLECTION_SUFFIX
-    coll = bpy.data.collections.get(coll_name)
-    if coll is None:
-        coll = bpy.data.collections.new(coll_name)
-        scene.collection.children.link(coll)
+# --- X mirroring -----------------------------------------------------------
+# Import and export both support "Mirror X". Reflecting a rig is its own
+# inverse, so the same function serves both directions.
+
+def _mv(v):
+    return (-v[0], v[1], v[2])
+
+
+def _mm(m):
+    # R' = M R M with M = diag(-1, 1, 1): flip the x component of every axis,
+    # then negate the X axis so the frame stays right-handed.
+    ax, ay, az = m[0:3], m[3:6], m[6:9]
+    return ((ax[0], -ax[1], -ax[2]) + (-ay[0], ay[1], ay[2]) + (-az[0], az[1], az[2])
+            + _mv(m[9:12]))
+
+
+def mirror_doc(doc: phys.PhysDoc) -> phys.PhysDoc:
+    for b in doc.bodies:
+        b.position = _mv(b.position)
+    for c in doc.capsules:
+        c.p1, c.p2 = _mv(c.p1), _mv(c.p2)
+    for s in doc.spheres:
+        s.center = _mv(s.center)
+    for bx in doc.boxes:
+        bx.frame = _mm(bx.frame)
+    for group in (doc.weld_joints, doc.shoulder_joints,
+                  doc.revolute_joints, doc.prismatic_joints):
+        for j in group:
+            j.frame_a, j.frame_b = _mm(j.frame_a), _mm(j.frame_b)
+    for group in (doc.spherical_joints, doc.distance_joints):
+        for j in group:
+            j.anchor_a, j.anchor_b = _mv(j.anchor_a), _mv(j.anchor_b)
+    # A reflection reverses the sense of rotation about Z.
+    for j in doc.shoulder_joints:
+        j.lower_twist, j.upper_twist = -j.upper_twist, -j.lower_twist
+    for j in doc.revolute_joints:
+        j.lower_angle, j.upper_angle = -j.upper_angle, -j.lower_angle
+    return doc
+
+
+# --- locating the data -----------------------------------------------------
+
+def discover(m2_path: str, explicit_path: str = "", pfdc: bytes = b""):
+    """Return ``(bytes, label)`` for this model's physics, or ``(None, "")``."""
+    if explicit_path:
+        if os.path.isfile(explicit_path):
+            with open(explicit_path, "rb") as f:
+                return f.read(), explicit_path
+        print("[phys] override path not found: " + explicit_path, flush=True)
+    if pfdc:
+        return bytes(pfdc), "PFDC chunk embedded in the .m2"
+    if not m2_path:
+        return None, ""
+    stem = os.path.splitext(m2_path)[0]
+    folder = os.path.dirname(m2_path) or "."
+    path = stem + ".phys"
+    if not os.path.isfile(path):
+        candidates = [f for f in os.listdir(folder) if f.lower().endswith(".phys")]
+        if len(candidates) == 1:
+            path = os.path.join(folder, candidates[0])
+            print("[phys] no '%s.phys'; using the only .phys in the folder: %s"
+                  % (os.path.basename(stem), candidates[0]), flush=True)
+        else:
+            if candidates:
+                print("[phys] several .phys files here (%s); choose one with "
+                      "'Phys File Override'" % ", ".join(candidates), flush=True)
+            return None, ""
+    with open(path, "rb") as f:
+        return f.read(), path
+
+
+# --- rest transforms -------------------------------------------------------
+
+def _joint_frames(doc: phys.PhysDoc, joint: phys.Joint):
+    """(frame_a, frame_b) as 4x4 matrices in each body's local space."""
+    t, i = joint.joint_type, joint.joint_id
+    table = {phys.JOINT_WELD: doc.weld_joints, phys.JOINT_SHOULDER: doc.shoulder_joints,
+             phys.JOINT_REVOLUTE: doc.revolute_joints,
+             phys.JOINT_PRISMATIC: doc.prismatic_joints}.get(t)
+    if table is not None:
+        if not 0 <= i < len(table):
+            return None
+        return (phys_rig.mat3x4_to_matrix(table[i].frame_a),
+                phys_rig.mat3x4_to_matrix(table[i].frame_b))
+    table = doc.spherical_joints if t == phys.JOINT_SPHERICAL else doc.distance_joints
+    if not 0 <= i < len(table):
+        return None
+    return (Matrix.Translation(Vector(table[i].anchor_a)),
+            Matrix.Translation(Vector(table[i].anchor_b)))
+
+
+def resolve_rest(doc: phys.PhysDoc) -> List[Matrix]:
+    """Armature-space rest matrix of every body.
+
+    Retail files are written two ways: bodies carry their model-space position,
+    or every position is zero and only the joint frames say where things sit.
+    Walking the joints outward from the root (B = A x frameA x frameB^-1) is
+    right for both; bodies no joint reaches keep their own position.
+    """
+    n = len(doc.bodies)
+    rest: List[Optional[Matrix]] = [None] * n
+    roots = [i for i, b in enumerate(doc.bodies) if b.type == phys.BODY_ROOT] or ([0] if n else [])
+    links = {}
+    for joint in doc.joints:
+        if joint.body_a < n and joint.body_b < n:
+            frames = _joint_frames(doc, joint)
+            if frames is not None:
+                links.setdefault(joint.body_a, []).append((joint.body_b, frames, False))
+                links.setdefault(joint.body_b, []).append((joint.body_a, frames, True))
+    # Point joints (spherical / distance) carry no orientation, so bodies stay
+    # axis-aligned through them, which is how the file stores bodies anyway.
+    queue = []
+    for r in roots:
+        rest[r] = Matrix.Translation(Vector(doc.bodies[r].position))
+        queue.append(r)
+    while queue:
+        a = queue.pop(0)
+        for b, (fa, fb), reverse in links.get(a, ()):
+            if rest[b] is not None:
+                continue
+            rest[b] = rest[a] @ (fb @ fa.inverted() if reverse else fa @ fb.inverted())
+            queue.append(b)
+    for i in range(n):
+        if rest[i] is None:
+            rest[i] = Matrix.Translation(Vector(doc.bodies[i].position))
+    return rest
+
+
+def _place_unreached(doc, rest, bone_names, arm_obj):
+    """A body no joint reaches and whose position is zero sits on its bone."""
+    for i, body in enumerate(doc.bodies):
+        if any(abs(v) > 1e-9 for v in body.position):
+            continue
+        if any(j.body_a == i or j.body_b == i for j in doc.joints):
+            continue
+        name = bone_names[body.bone_index] if body.bone_index < len(bone_names) else ""
+        bone = arm_obj.data.bones.get(name) if name else None
+        if bone is not None:
+            rest[i] = Matrix.Translation(bone.head_local)
+
+
+# --- building --------------------------------------------------------------
+
+def _fill_shape(shape_props, doc: phys.PhysDoc, s: phys.Shape):
+    shape_props.kind = phys_rig.shape_kind_token(s.shape_type)
+    shape_props.friction = s.friction
+    shape_props.restitution = s.restitution
+    shape_props.density = max(s.density, 0.0001)
+    shape_props.unk_hex = bytes(s.unk).hex()
+    shape_props.x14 = int(s.x14) if s.x14 < 0x80000000 else int(s.x14) - 0x100000000
+    shape_props.x18 = s.x18
+    shape_props.x1c = s.x1c
+    shape_props.x1e = s.x1e
+    i = s.shape_index
+    if s.shape_type == phys.SHAPE_CAPSULE and 0 <= i < len(doc.capsules):
+        c = doc.capsules[i]
+        shape_props.p1, shape_props.p2, shape_props.radius = c.p1, c.p2, max(c.radius, 0.0005)
+    elif s.shape_type == phys.SHAPE_SPHERE and 0 <= i < len(doc.spheres):
+        sp = doc.spheres[i]
+        shape_props.p1, shape_props.radius = sp.center, max(sp.radius, 0.0005)
+    elif s.shape_type == phys.SHAPE_BOX and 0 <= i < len(doc.boxes):
+        bx = doc.boxes[i]
+        shape_props.p1 = bx.frame[9:12]
+        shape_props.box_axes = bx.frame[0:9]
+        shape_props.half_extents = [max(h, 0.0005) for h in bx.half_extents]
+    else:
+        shape_props.kind = "POLYTOPE"
+        shape_props.polytope_index = i
+
+
+def _fill_joint(props, doc: phys.PhysDoc, joint: phys.Joint):
+    t, i = joint.joint_type, joint.joint_id
+    props.joint_type = phys_rig.joint_type_token(t)
+    props.unk_hex = bytes(joint.unk).hex()
+    if t == phys.JOINT_WELD:
+        w = doc.weld_joints[i]
+        props.angular_frequency_hz = w.angular_frequency_hz
+        props.angular_damping_ratio = w.angular_damping_ratio
+        props.linear_frequency_hz = w.linear_frequency_hz
+        props.linear_damping_ratio = w.linear_damping_ratio
+        props.unk70 = w.unk70
+    elif t == phys.JOINT_SPHERICAL:
+        props.friction_torque = doc.spherical_joints[i].friction_torque
+    elif t == phys.JOINT_SHOULDER:
+        s = doc.shoulder_joints[i]
+        props.lower_twist = max(-180.0, min(0.0, s.lower_twist))
+        props.upper_twist = max(0.0, min(180.0, s.upper_twist))
+        props.cone_angle = max(0.0, min(180.0, s.cone_angle))
+        props.max_motor_torque = s.max_motor_torque
+        props.motor_mode = int(s.motor_mode) & 0x7FFFFFFF
+        props.motor_frequency_hz = s.motor_frequency_hz
+        props.motor_damping_ratio = s.motor_damping_ratio
+    elif t == phys.JOINT_REVOLUTE:
+        r = doc.revolute_joints[i]
+        props.lower_limit, props.upper_limit = r.lower_angle, r.upper_angle
+        props.max_motor_torque = r.max_motor_torque
+        props.motor_mode = int(r.motor_mode) & 0x7FFFFFFF
+        props.motor_frequency_hz = r.motor_frequency_hz
+        props.motor_damping_ratio = r.motor_damping_ratio
+    elif t == phys.JOINT_PRISMATIC:
+        p = doc.prismatic_joints[i]
+        props.lower_limit, props.upper_limit = p.lower_limit, p.upper_limit
+        props.x68, props.x70 = p.x68, p.x70
+        props.max_motor_torque = p.max_motor_force
+        props.motor_mode = int(p.motor_mode) & 0x7FFFFFFF
+        props.motor_frequency_hz = p.motor_frequency_hz
+        props.motor_damping_ratio = p.motor_damping_ratio
+    elif t == phys.JOINT_DISTANCE:
+        props.distance_factor = doc.distance_joints[i].distance_factor
+
+
+def build_rig(context, doc: phys.PhysDoc, arm_obj, model_name: str,
+              mirror_x: bool = False):
+    """Create the rig collection for ``doc`` on ``arm_obj``. Returns it."""
+    if mirror_x:
+        mirror_doc(doc)
+    phys_rig.ensure_world(context)
+
+    old = phys_rig.find_rig(context, arm_obj)
+    if old is not None and old.m2_phys_rig.armature == arm_obj:
+        phys_rig.stop_playback(context)
+        phys_rig.clear_follow(arm_obj, old)
+        for obj in list(old.objects):
+            phys_rig.remove_object(obj)
+        bpy.data.collections.remove(old)
+
+    coll = phys_rig.ensure_rig(context, arm_obj, model_name)
+    rig = coll.m2_phys_rig
+    rig.version = doc.version
+    rig.has_phyt = doc.phyt is not None
+    phyt = doc.phyt or 0
+    rig.phyt = phyt if phyt < 0x80000000 else phyt - 0x100000000
+    rig.chunk_order = ",".join(doc.chunk_order)
+    rig.tags = phys_rig.format_tags(doc.tags)
+    rig.shoulder_size = doc.shoulder_size
+    rig.raw_chunks = phys_rig.format_raw_chunks(doc.raw_chunks)
+
+    bone_names = _bone_names(arm_obj)
+    arm_world = arm_obj.matrix_world
+    rest = resolve_rest(doc)
+    _place_unreached(doc, rest, bone_names, arm_obj)
+
+    bodies = []
+    with phys_rig.suppress_updates():
+        for i, body in enumerate(doc.bodies):
+            bone = bone_names[body.bone_index] if body.bone_index < len(bone_names) else ""
+            if not bone:
+                print("[phys] body %d names bone %d, which the armature lacks"
+                      % (i, body.bone_index), flush=True)
+            token = phys_rig.body_type_token(body.type)
+            if body.type == phys.BODY_ROOT and not any(
+                    b.m2_phys_body.body_type == "ROOT" for b in bodies):
+                token = "ROOT"                      # first anchor in the file
+            label = "root" if token == "ROOT" else (bone or "%02d" % i)
+            obj = phys_rig.new_body(context, coll, "phys_body_" + label,
+                                    arm_world @ rest[i], token, bone)
+            props = obj.m2_phys_body
+            props.file_body_type = int(body.type)
+            props.file_body_token = token
+            props.drag, props.unk0, props.x1c = body.drag, body.unk0, body.x1c
+            props.unk1, props.x28 = body.unk1, body.x28
+            props.x2c_hex = bytes(body.x2c).hex()
+            props.pad_a_hex = bytes(body.pad_a).hex()
+            props.pad_b_hex = bytes(body.pad_b).hex()
+            props.file_position = body.position
+            props.has_file_position = True
+            props.file_index = i
+            for s in doc.shapes[body.shapes_base:body.shapes_base + max(body.shapes_count, 0)]:
+                _fill_shape(props.shapes.add(), doc, s)
+            bodies.append(obj)
+
+    for obj in bodies:
+        phys_rig.rebuild_body(context, obj)
+    context.view_layer.update()
+    with phys_rig.suppress_updates():
+        for obj in bodies:
+            obj.m2_phys_body.rest_location = phys_rig.body_frame_world(obj).translation
+
+    made = 0
+    for ji, joint in enumerate(doc.joints):
+        if joint.body_a >= len(bodies) or joint.body_b >= len(bodies):
+            print("[phys] joint %d references a missing body; skipped" % ji, flush=True)
+            continue
+        frames = _joint_frames(doc, joint)
+        if frames is None:
+            print("[phys] joint %d has no data record; skipped" % ji, flush=True)
+            continue
+        a, b = bodies[joint.body_a], bodies[joint.body_b]
+        world = arm_world @ rest[joint.body_a] @ frames[0]
+        name = "phys_joint_%s" % (b.m2_phys_body.bone or "%02d" % ji)
+        with phys_rig.suppress_updates():
+            empty = phys_rig.new_joint(context, coll, name, world, a, b)
+            props = empty.m2_phys_joint
+            _fill_joint(props, doc, joint)
+            props.frame_a = phys_rig.matrix_to_mat3x4(frames[0]) \
+                if joint.joint_type in (phys.JOINT_SPHERICAL, phys.JOINT_DISTANCE) \
+                else _raw_frame(doc, joint, "a")
+            props.frame_b = phys_rig.matrix_to_mat3x4(frames[1]) \
+                if joint.joint_type in (phys.JOINT_SPHERICAL, phys.JOINT_DISTANCE) \
+                else _raw_frame(doc, joint, "b")
+            props.has_file_frames = True
+            props.file_index = ji
+        phys_rig.sync_constraint(context, empty)
+        with phys_rig.suppress_updates():
+            props.rest_matrix = [v for row in phys_rig.rest_world(empty) for v in row]
+        made += 1
+
+    phys_rig.apply_self_collision(coll, context.scene.m2_physics.self_collision
+                                  if hasattr(context.scene, "m2_physics") else False)
+    print("[phys] built rig '%s' (%s): %d bodies, %d joints"
+          % (coll.name, phys.summary(doc), len(bodies), made), flush=True)
     return coll
 
 
-def _ensure_rigid_body_world(context):
-    if context.scene.rigidbody_world is None:
-        bpy.ops.rigidbody.world_add()
-    if context.scene.rigidbody_world.collection is None:
-        rb_coll = bpy.data.collections.new("RigidBodyWorld")
-        context.scene.rigidbody_world.collection = rb_coll
-
-
-def _wow_to_blender_vec(v, mirror_x: bool) -> Vector:
-    return Vector((-v[0], v[1], v[2])) if mirror_x else Vector(v)
-
-
-def _parent_to_bone(obj, arm_obj, bone_name: str, local_pos: Vector):
-    """Parent `obj` to a bone; put it at the given local offset from bone head."""
-    obj.parent = arm_obj
-    obj.parent_type = "BONE"
-    obj.parent_bone = bone_name
-    # Blender's BONE parenting places the child at the bone's TAIL by default,
-    # then applies matrix_parent_inverse. Set matrix_world so the object ends
-    # up at bone.head + local_pos in armature space.
-    bone = arm_obj.data.bones.get(bone_name)
-    if bone is None:
-        obj.matrix_world = arm_obj.matrix_world @ Matrix.Translation(local_pos)
-        return
-    bone_world = arm_obj.matrix_world @ bone.matrix_local
-    obj.matrix_world = bone_world @ Matrix.Translation(local_pos)
-
-
-def _make_shape_object(doc: phys.PhysDoc, shape_slot: int, name: str,
-                       coll) -> Optional[object]:
-    """Create a primitive mesh sized to match the shape at doc.shapes[slot]."""
-    if shape_slot < 0 or shape_slot >= len(doc.shapes):
-        return None
-    s = doc.shapes[shape_slot]
-
-    if s.shape_type == phys.SHAPE_BOX and s.shape_index < len(doc.boxes):
-        bx = doc.boxes[s.shape_index]
-        hx, hy, hz = bx.half_extents
-        # Build a cube mesh with matching dimensions directly, no ops call.
-        me = bpy.data.meshes.new(name + "_mesh")
-        verts = [(x*hx, y*hy, z*hz)
-                 for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-        faces = [(0,1,3,2),(4,5,7,6),(0,1,5,4),(2,3,7,6),(0,2,6,4),(1,3,7,5)]
-        me.from_pydata(verts, [], faces)
-        me.update()
-        obj = bpy.data.objects.new(name, me)
-        coll.objects.link(obj)
-        blender_shape = "BOX"
-    elif s.shape_type == phys.SHAPE_SPHERE and s.shape_index < len(doc.spheres):
-        sp = doc.spheres[s.shape_index]
-        r = sp.radius
-        me = _icosphere_mesh(name + "_mesh", r, subdivisions=2)
-        obj = bpy.data.objects.new(name, me)
-        coll.objects.link(obj)
-        blender_shape = "SPHERE"
-    elif s.shape_type == phys.SHAPE_CAPSULE and s.shape_index < len(doc.capsules):
-        c = doc.capsules[s.shape_index]
-        p1, p2 = Vector(c.p1), Vector(c.p2)
-        axis = p2 - p1
-        length = axis.length
-        radius = c.radius
-        me = _cylinder_mesh(name + "_mesh", radius, length + 2*radius, segments=12)
-        obj = bpy.data.objects.new(name, me)
-        coll.objects.link(obj)
-        blender_shape = "CAPSULE"
-        # Local origin is midpoint of p1/p2 in body space; cylinder built
-        # along +Z. If p1/p2 aren't Z-aligned, the round-trip loses a
-        # rotation — accept for now; retail samples are all Z-aligned.
-        mid = (p1 + p2) * 0.5
-        obj.location = mid
-    else:
-        return None
-
-    obj["m2_phys_shape_type"] = int(s.shape_type)
-    obj["m2_phys_shape_index"] = int(s.shape_index)
-    obj["m2_phys_friction"] = float(s.friction)
-    obj["m2_phys_restitution"] = float(s.restitution)
-    obj["m2_phys_density"] = float(s.density)
-    # SHAP has a 4-byte "unk" field the sample .phys uses non-zero. Stash
-    # it as hex so the exporter can round-trip the exact byte pattern
-    # rather than emitting zero — otherwise re-export != original file.
-    try:
-        obj["m2_phys_shape_unk"] = bytes(s.unk).hex()
-    except Exception:  # noqa: BLE001 — defensive: writer always supplies 4 bytes
-        obj["m2_phys_shape_unk"] = "00000000"
-    obj["_m2_phys_blender_shape"] = blender_shape
-    return obj
-
-
-def _icosphere_mesh(name: str, radius: float, subdivisions: int = 2):
-    """Build a simple UV sphere mesh without bpy.ops."""
-    import math
-    me = bpy.data.meshes.new(name)
-    rings = max(6, subdivisions * 4)
-    segments = max(8, subdivisions * 6)
-    verts = []
-    faces = []
-    for r in range(rings + 1):
-        theta = math.pi * r / rings
-        z = math.cos(theta) * radius
-        rr = math.sin(theta) * radius
-        for s in range(segments):
-            phi = 2 * math.pi * s / segments
-            verts.append((rr * math.cos(phi), rr * math.sin(phi), z))
-    for r in range(rings):
-        for s in range(segments):
-            a = r * segments + s
-            b = r * segments + (s + 1) % segments
-            c = (r + 1) * segments + (s + 1) % segments
-            d = (r + 1) * segments + s
-            faces.append((a, b, c, d))
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _cylinder_mesh(name: str, radius: float, height: float, segments: int = 12):
-    import math
-    me = bpy.data.meshes.new(name)
-    verts = []
-    h2 = height * 0.5
-    for s in range(segments):
-        a = 2 * math.pi * s / segments
-        x, y = math.cos(a) * radius, math.sin(a) * radius
-        verts.append((x, y, -h2))
-        verts.append((x, y, +h2))
-    faces = []
-    for s in range(segments):
-        bl = 2 * s
-        tl = 2 * s + 1
-        br = 2 * ((s + 1) % segments)
-        tr = 2 * ((s + 1) % segments) + 1
-        faces.append((bl, br, tr, tl))
-    # Caps
-    bottom = [2*s for s in range(segments)]
-    top = [2*s + 1 for s in range(segments)]
-    faces.append(tuple(reversed(bottom)))
-    faces.append(tuple(top))
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _apply_rigid_body(context, obj, is_active: bool, blender_shape: str,
-                      friction: float, restitution: float, density: float,
-                      kinematic: bool = False):
-    """Add the object to the rigid body world with matching settings.
-
-    kinematic=True gives a PASSIVE body that follows its parent-transform
-    (bone parenting, animation) instead of the physics sim — the correct
-    setup for a WoW phys root, which anchors the whole chain to a bone.
-    """
-    context.view_layer.objects.active = obj
-    obj.select_set(True)
-    if obj.rigid_body is None:
-        try:
-            bpy.ops.rigidbody.object_add(type="ACTIVE" if is_active else "PASSIVE")
-        except RuntimeError:
-            return
-    else:
-        obj.rigid_body.type = "ACTIVE" if is_active else "PASSIVE"
-    obj.rigid_body.collision_shape = blender_shape
-    obj.rigid_body.friction = friction
-    obj.rigid_body.restitution = restitution
-    obj.rigid_body.mass = max(density, 0.001)
-    if kinematic:
-        obj.rigid_body.kinematic = True
-    obj.select_set(False)
-
-
-def _apply_constraint(context, empty, con_type: str, obj_a, obj_b):
-    context.view_layer.objects.active = empty
-    empty.select_set(True)
-    if empty.rigid_body_constraint is None:
-        try:
-            bpy.ops.rigidbody.constraint_add(type=con_type)
-        except RuntimeError:
-            return
-    else:
-        empty.rigid_body_constraint.type = con_type
-    con = empty.rigid_body_constraint
-    con.enabled = True
-    con.object1 = obj_a
-    con.object2 = obj_b
-    empty.select_set(False)
-
-
-def _joint_to_blender_type(joint_type: int) -> str:
-    return {
-        phys.JOINT_WELD: "FIXED",
-        phys.JOINT_SPHERICAL: "POINT",
-        phys.JOINT_SHOULDER: "GENERIC",
-        phys.JOINT_REVOLUTE: "HINGE",
-        phys.JOINT_PRISMATIC: "SLIDER",
-        phys.JOINT_DISTANCE: "GENERIC_SPRING",
-    }.get(joint_type, "FIXED")
-
-
-def _discover_phys(m2_path: str, explicit_path: str = "") -> Optional[str]:
-    """Pick a .phys file for this .m2.
-
-    Priority: user-supplied path → `<stem>.phys` sibling → any single
-    .phys in the same folder (helpful when the sample dump has a phys
-    file with a different stem than the .m2, but only one candidate).
-    Returns None if nothing suitable is found.
-    """
-    if explicit_path:
-        if os.path.isfile(explicit_path):
-            return explicit_path
-        print("[phys-import] explicit path not found: " + explicit_path,
-              flush=True)
-    stem = os.path.splitext(m2_path)[0]
-    sib = stem + ".phys"
-    if os.path.isfile(sib):
-        return sib
-    folder = os.path.dirname(m2_path) or "."
-    candidates = [f for f in os.listdir(folder) if f.lower().endswith(".phys")]
-    if len(candidates) == 1:
-        p = os.path.join(folder, candidates[0])
-        print("[phys-import] no stem match; using the only .phys in the "
-              "folder: " + candidates[0], flush=True)
-        return p
-    if candidates:
-        print("[phys-import] no stem match; multiple .phys files present "
-              "(%s) — pick one via 'Phys File Override' or rename it to "
-              "'%s.phys'" % (candidates, os.path.basename(stem)),
-              flush=True)
-    return None
+def _raw_frame(doc, joint, side):
+    table = {phys.JOINT_WELD: doc.weld_joints, phys.JOINT_SHOULDER: doc.shoulder_joints,
+             phys.JOINT_REVOLUTE: doc.revolute_joints,
+             phys.JOINT_PRISMATIC: doc.prismatic_joints}[joint.joint_type]
+    rec = table[joint.joint_id]
+    return rec.frame_a if side == "a" else rec.frame_b
 
 
 def load_phys_into_scene(context, m2_path: str, arm_obj, model_name: str,
-                         mirror_x: bool = False,
-                         explicit_path: str = "") -> Optional[str]:
-    """If a matching .phys exists, rebuild the rigid-body world for it.
-
-    Returns the .phys path on success, None if there is nothing to load.
-    """
-    phys_path = _discover_phys(m2_path, explicit_path)
-    if phys_path is None:
+                         mirror_x: bool = False, explicit_path: str = "",
+                         pfdc: bytes = b"") -> Optional[str]:
+    """Import this model's physics if it has any. Returns a label for where the
+    data came from, or None when there was nothing to load."""
+    data, label = discover(m2_path, explicit_path, pfdc)
+    if data is None:
         return None
-
     if arm_obj is None:
-        print("[phys-import] no armature to parent physics onto: skipping "
-              + phys_path, flush=True)
+        print("[phys] the model has physics but no armature was imported; "
+              "skipping", flush=True)
         return None
-
     try:
-        with open(phys_path, "rb") as f:
-            doc = phys.read(f.read())
+        doc = phys.read(data)
     except Exception as exc:  # noqa: BLE001
-        print("[phys-import] read failed on %s: %s" % (phys_path, exc), flush=True)
+        print("[phys] could not read %s: %s" % (label, exc), flush=True)
         return None
-
     if not doc.bodies:
-        print("[phys-import] %s has no bodies: nothing to do" % phys_path,
-              flush=True)
+        print("[phys] %s has no bodies; nothing to build" % label, flush=True)
         return None
-
-    _ensure_rigid_body_world(context)
-    coll = _ensure_phys_collection(context, model_name)
-
-    bone_names = _bone_name_by_m2_index(arm_obj)
-
-    # Two passes so we know all objects before wiring joints.
-    body_objs: List[object] = []
-    for i, body in enumerate(doc.bodies):
-        bone_name = bone_names[body.bone_index] if body.bone_index < len(bone_names) else ""
-        obj_name = f"{model_name}_phys_body{i:02d}"
-
-        is_root = body.type == phys.BODY_ROOT
-        if body.shapes_count > 0 and body.shapes_base < len(doc.shapes):
-            obj = _make_shape_object(doc, body.shapes_base,
-                                     obj_name, coll)
-        else:
-            obj = None
-
-        if obj is None:
-            # Root / shapeless body: give it a tiny cube mesh so it can
-            # carry a Rigid Body — constraints need both sides to be
-            # rigid bodies, and Blender empties don't participate.
-            me = bpy.data.meshes.new(obj_name + "_mesh")
-            r = 0.03
-            verts = [(x*r, y*r, z*r) for x in (-1,1) for y in (-1,1) for z in (-1,1)]
-            faces = [(0,1,3,2),(4,5,7,6),(0,1,5,4),(2,3,7,6),(0,2,6,4),(1,3,7,5)]
-            me.from_pydata(verts, [], faces)
-            me.update()
-            obj = bpy.data.objects.new(obj_name, me)
-            coll.objects.link(obj)
-            obj["_m2_phys_blender_shape"] = "BOX"
-
-        obj.display_type = "WIRE"
-        obj["m2_phys_body_type"] = int(body.type)
-        obj["m2_phys_bone_index"] = int(body.bone_index)
-        if is_root:
-            obj["m2_phys_root"] = True
-
-        pos = _wow_to_blender_vec(body.position, mirror_x)
-        is_dynamic = (not is_root and body.type == phys.BODY_DYNAMIC)
-        if bone_name and not is_dynamic:
-            # Kinematic / root: bone-parenting is safe because these
-            # bodies don't feed back into the sim through a bone
-            # constraint.
-            _parent_to_bone(obj, arm_obj, bone_name, pos)
-        elif bone_name:
-            # Dynamic body — DO NOT bone-parent. If a preset later adds
-            # a Copy Rotation constraint on this bone (or any ancestor)
-            # that reads the sim result, the parent-child chain would
-            # form a depsgraph cycle:
-            #   sim → body → bone parent → bone-with-Copy-Rotation → body
-            # Instead, seed world matrix so the body starts at the bone
-            # head + local offset; the exporter reads the bone name from
-            # the custom prop below to write body.bone_index.
-            bone = arm_obj.data.bones.get(bone_name)
-            if bone is not None:
-                bone_world = arm_obj.matrix_world @ bone.matrix_local
-                obj.matrix_world = bone_world @ Matrix.Translation(pos)
-            else:
-                obj.location = pos
-            obj["m2_phys_bone_name"] = bone_name
-        else:
-            obj.location = pos
-
-        if obj.data is not None:
-            # Root: PASSIVE + kinematic so it follows the bone anchor
-            # instead of falling; every non-root dynamic body is ACTIVE.
-            is_active = (not is_root
-                         and body.type == phys.BODY_DYNAMIC)
-            blender_shape = obj.get("_m2_phys_blender_shape", "BOX")
-            friction = obj.get("m2_phys_friction", 0.5)
-            restitution = obj.get("m2_phys_restitution", 0.0)
-            density = obj.get("m2_phys_density", 1.0)
-            _apply_rigid_body(context, obj, is_active, blender_shape,
-                              float(friction), float(restitution),
-                              float(density),
-                              kinematic=is_root)
-
-        body_objs.append(obj)
-
-    for ji, joint in enumerate(doc.joints):
-        if joint.body_a >= len(body_objs) or joint.body_b >= len(body_objs):
-            continue
-        con_type = _joint_to_blender_type(joint.joint_type)
-        empty_name = f"{model_name}_phys_join{ji:02d}"
-        empty = bpy.data.objects.new(empty_name, None)
-        empty.empty_display_type = "PLAIN_AXES"
-        empty.empty_display_size = 0.03
-        coll.objects.link(empty)
-        empty["m2_phys_joint_type"] = int(joint.joint_type)
-        empty["m2_phys_joint_id"] = int(joint.joint_id)
-        try:
-            empty["m2_phys_joint_unk"] = bytes(joint.unk).hex()
-        except Exception:  # noqa: BLE001
-            empty["m2_phys_joint_unk"] = "00000000"
-        # Stash the per-joint-kind payload so the exporter can emit the
-        # exact WELJ/SPHJ/SHOJ record instead of a default one. Without
-        # this, imported .phys files re-export with identity frames /
-        # zero anchors / zero twist-cone — the rig still holds together
-        # but every frame_a/frame_b/anchor/twist/cone gets wiped.
-        if joint.joint_type == phys.JOINT_WELD and joint.joint_id < len(doc.weld_joints):
-            w = doc.weld_joints[joint.joint_id]
-            empty["m2_phys_weld_frame_a"] = list(w.frame_a)
-            empty["m2_phys_weld_frame_b"] = list(w.frame_b)
-            empty["m2_phys_weld_ang_freq_hz"] = float(w.angular_frequency_hz)
-            empty["m2_phys_weld_ang_damp"] = float(w.angular_damping_ratio)
-        elif (joint.joint_type == phys.JOINT_SPHERICAL
-              and joint.joint_id < len(doc.spherical_joints)):
-            s = doc.spherical_joints[joint.joint_id]
-            empty["m2_phys_sph_anchor_a"] = list(s.anchor_a)
-            empty["m2_phys_sph_anchor_b"] = list(s.anchor_b)
-            empty["m2_phys_sph_friction"] = float(s.friction_torque)
-        elif (joint.joint_type == phys.JOINT_SHOULDER
-              and joint.joint_id < len(doc.shoulder_joints)):
-            sh = doc.shoulder_joints[joint.joint_id]
-            empty["m2_phys_shoulder_frame_a"] = list(sh.frame_a)
-            empty["m2_phys_shoulder_frame_b"] = list(sh.frame_b)
-            empty["m2_phys_shoulder_lower_twist"] = float(sh.lower_twist)
-            empty["m2_phys_shoulder_upper_twist"] = float(sh.upper_twist)
-            empty["m2_phys_shoulder_cone"] = float(sh.cone_angle)
-        # Place at midpoint of the two body pivots for visibility.
-        a = body_objs[joint.body_a].matrix_world.translation
-        b = body_objs[joint.body_b].matrix_world.translation
-        empty.location = (a + b) * 0.5
-        _apply_constraint(context, empty, con_type,
-                          body_objs[joint.body_a], body_objs[joint.body_b])
-
-    print("[phys-import] %s -> %d bodies, %d shapes, %d joints"
-          % (os.path.basename(phys_path), len(doc.bodies),
-             len(doc.shapes), len(doc.joints)), flush=True)
-    return phys_path
+    print("[phys] loading %s" % label, flush=True)
+    build_rig(context, doc, arm_obj, model_name, mirror_x=mirror_x)
+    return label

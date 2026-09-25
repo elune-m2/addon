@@ -1,1275 +1,807 @@
-"""M2 Physics panel: build a rigid-body rig from bones and control it live.
+"""M2 Physics panel: build, tune, preview and export a WoW physics rig.
 
-Two primary buttons — **Add Physics Mesh** and **Add Collision Mesh** —
-each create a body attached to the active pose bone (or at the 3D cursor
-if no bone is active). The panel then reflects the selection:
-
-  - selecting a body                → live shape / friction / mass / bone
-  - selecting a joint empty         → live joint type + body A/B
-  - being in Pose Mode with a bone  → 'add body at this bone' shortcut
-  - otherwise                       → global setup + preview controls
-
-All property edits update Blender's rigid body settings the instant they
-change, so you can drag friction/mass sliders while the sim plays.
+The panel follows the selection: a body shows its type, bone, mass and shapes;
+a joint shows its type and limits; otherwise it shows rig creation tools.
+``Start Preview`` runs the rig with Blender's rigid-body solver and makes the
+skeleton follow it, so the mesh moves the way it will in game.
 """
 
 from __future__ import annotations
 
-import math
+import os
 
 import bpy
-from bpy.props import (
-    BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty,
-    StringProperty,
-)
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 from mathutils import Matrix, Vector
 
-from . import phys
+from . import phys, phys_from_scene, phys_rig, phys_to_scene
 
-
-PHYS_COLLECTION_SUFFIX = "_phys"
 
 # ---------------------------------------------------------------------------
-# Scene-level defaults for "add mesh" actions
+# Scene settings
 # ---------------------------------------------------------------------------
+
+def _on_self_collision(self, context):
+    phys_rig.stop_playback(context)
+    coll = phys_rig.find_rig(context)
+    if coll is not None:
+        phys_rig.apply_self_collision(coll, self.self_collision)
+        phys_rig.reset_simulation(context)
+
 
 class M2PhysicsProps(PropertyGroup):
-    shape_type: EnumProperty(
-        name="Shape",
-        description="Shape kind for the next Add action",
-        items=[
-            ("CAPSULE", "Capsule", "Aligned to the bone axis"),
-            ("BOX",     "Box",     "Aligned to the bone axis"),
-            ("SPHERE",  "Sphere",  "Centred on the bone midpoint"),
-        ],
-        default="CAPSULE",
-    )
-    default_radius: FloatProperty(
-        name="Default Radius / Half-thickness",
-        default=0.03, min=0.001, max=10.0,
-    )
-    preview_start: IntProperty(name="Frame Start", default=1, min=0)
-    preview_end: IntProperty(name="Frame End", default=120, min=1)
+    shape_kind: EnumProperty(
+        name="Shape", items=[i for i in phys_rig.SHAPE_KIND_ITEMS if i[0] != "POLYTOPE"],
+        default="CAPSULE", description="Shape for new bodies")
+    radius: FloatProperty(
+        name="Radius", default=0.0, min=0.0, unit="LENGTH", precision=4,
+        description="Radius for new bodies. 0 = pick one from the bone's length")
+    joint_type: EnumProperty(name="Joint", items=phys_rig.JOINT_TYPE_ITEMS, default="SHOULDER",
+                             description="Joint type used by Connect Selected")
+    self_collision: BoolProperty(
+        name="Bodies Collide With Each Other", default=False,
+        description="Let simulated bodies hit one another in the preview. Off, they only "
+                    "hit kinematic bodies, which is steadier for strips of cloth that sit "
+                    "side by side", update=_on_self_collision)
+
+
+# name -> (joint type, joint values, body values, shape values, mass,
+#          shape kind or None to use the panel's setting)
+_PRESETS = {
+    # Values from a retail cloth buckle (buckle_panstart_a_01.phys).
+    # All presets use shoulder joints with a return spring: the only joint kind
+    # confirmed to work on a player model in game, and what every retail
+    # mount / belt uses. Numbers come from those retail rigs.
+    "CLOTH": ("SHOULDER",                                   # rostrumstormgryphon reins
+              dict(lower_twist=-10.0, upper_twist=10.0, cone_angle=40.0,
+                   max_motor_torque=0.0, motor_mode=0, motor_frequency_hz=1.0,
+                   motor_damping_ratio=0.7),
+              dict(drag=0.0, unk0=1.0, unk1=10.0, x28=0.01),
+              dict(friction=0.7, restitution=0.1), 2.0, None),
+    "CHAIN": ("SHOULDER",                                   # belt_leather_raidmonknerubian
+              dict(lower_twist=-25.0, upper_twist=25.0, cone_angle=60.0,
+                   max_motor_torque=0.0, motor_mode=0, motor_frequency_hz=1.0,
+                   motor_damping_ratio=0.7),
+              dict(drag=3.0, unk0=1.0, unk1=10.0, x28=0.01),
+              dict(friction=0.4, restitution=0.05), 2.0, None),
+    "JIGGLE": ("SHOULDER",                                  # companionnetherwingdrake dangles
+               dict(lower_twist=-5.0, upper_twist=5.0, cone_angle=45.0,
+                    max_motor_torque=0.0, motor_mode=1, motor_frequency_hz=3.0,
+                    motor_damping_ratio=0.7),
+               dict(drag=6.0, unk0=0.25, unk1=6.0, x28=0.01),
+               dict(friction=0.5, restitution=0.0), 1.0, None),
+    # Chest, belly, thighs: a small cone so it cannot flap, a firm spring back
+    # to rest and plenty of drag, so wind and armour only nudge it.
+    "BODY": ("SHOULDER",
+             dict(lower_twist=-3.0, upper_twist=3.0, cone_angle=12.0,
+                  max_motor_torque=0.0, motor_mode=1, motor_frequency_hz=3.0,
+                  motor_damping_ratio=0.7),
+             dict(drag=8.0, unk0=0.1, unk1=10.0, x28=0.01),
+             dict(friction=0.5, restitution=0.0), 0.8, "SPHERE"),
+}
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _get_active_armature(context):
-    for candidate in (context.active_object,
-                      context.view_layer.objects.active,
-                      context.object):
-        if candidate is not None and candidate.type == "ARMATURE":
-            return candidate
-    for obj in context.selected_objects:
-        if obj.type == "ARMATURE":
-            return obj
-    return None
+class _object_mode:
+    """Run in Object Mode, then return to the mode the user was in."""
 
+    def __init__(self, context):
+        self.context = context
 
-def _model_name(context):
-    arm = _get_active_armature(context)
-    return arm.name if arm is not None else "M2"
+    def __enter__(self):
+        self.prev = self.context.mode
+        self.active = self.context.view_layer.objects.active
+        if self.prev != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError:
+                pass
 
-
-def _ensure_world(context):
-    if context.scene.rigidbody_world is None:
-        bpy.ops.rigidbody.world_add()
-    if context.scene.rigidbody_world.collection is None:
-        rb_coll = bpy.data.collections.new("RigidBodyWorld")
-        context.scene.rigidbody_world.collection = rb_coll
-
-
-def _phys_collection(context, name: str):
-    coll_name = name + PHYS_COLLECTION_SUFFIX
-    coll = bpy.data.collections.get(coll_name)
-    if coll is None:
-        coll = bpy.data.collections.new(coll_name)
-        context.scene.collection.children.link(coll)
-    return coll
-
-
-def _find_phys_collection(context):
-    """Locate the phys collection for the active rig without assuming a
-    particular naming convention.
-
-    Preference order:
-      1. `<active-armature-name>_phys`   (matches what authoring creates)
-      2. `<armature-name minus '_Armature' suffix>_phys` (matches what
-         the M2 importer creates, since armatures are named
-         `<m2filename>_Armature` but the .phys collection is named after
-         the raw m2 filename)
-      3. Any collection whose name ends with `_phys` and which contains
-         a rigid body — used when the user has renamed either side.
-
-    Returns None only if there is no `_phys` collection in the scene at all.
-    """
-    arm = _get_active_armature(context)
-    if arm is not None:
-        exact = bpy.data.collections.get(arm.name + PHYS_COLLECTION_SUFFIX)
-        if exact is not None:
-            return exact
-        base = arm.name
-        for suffix in ("_Armature", "_armature", ".Armature"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-                break
-        candidate = bpy.data.collections.get(base + PHYS_COLLECTION_SUFFIX)
-        if candidate is not None:
-            return candidate
-    # Last resort: pick a _phys collection that actually contains rigid bodies.
-    for c in bpy.data.collections:
-        if c.name.endswith(PHYS_COLLECTION_SUFFIX) and any(
-                o.rigid_body is not None for o in c.objects):
-            return c
-    return None
-
-
-def _cube_mesh(name: str, hx: float, hy: float, hz: float):
-    me = bpy.data.meshes.new(name)
-    verts = [(x*hx, y*hy, z*hz)
-             for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-    faces = [(0,1,3,2),(4,5,7,6),(0,1,5,4),(2,3,7,6),(0,2,6,4),(1,3,7,5)]
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _cylinder_mesh(name: str, radius: float, height: float, segments: int = 12,
-                   along_y: bool = False):
-    """Cylinder along local Z by default; pass `along_y=True` to get a
-    cylinder along local +Y with its BOTTOM at the origin (extending
-    from y=0 to y=height) — the geometry a bone-aligned body needs so
-    its object matrix can equal the bone's rest matrix exactly."""
-    me = bpy.data.meshes.new(name)
-    verts, faces = [], []
-    for s in range(segments):
-        a = 2 * math.pi * s / segments
-        cx, cy = math.cos(a) * radius, math.sin(a) * radius
-        if along_y:
-            # Along +Y, base at y=0, top at y=height. Cross-section in XZ.
-            verts.append((cx, 0.0,   cy))
-            verts.append((cx, height, cy))
-        else:
-            h2 = height * 0.5
-            verts.append((cx, cy, -h2))
-            verts.append((cx, cy, +h2))
-    for s in range(segments):
-        bl = 2 * s
-        tl = 2 * s + 1
-        br = 2 * ((s + 1) % segments)
-        tr = 2 * ((s + 1) % segments) + 1
-        faces.append((bl, br, tr, tl))
-    faces.append(tuple(reversed([2*s for s in range(segments)])))
-    faces.append(tuple([2*s + 1 for s in range(segments)]))
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _uv_sphere_mesh(name: str, radius: float, rings: int = 8, segments: int = 12):
-    me = bpy.data.meshes.new(name)
-    verts, faces = [], []
-    for r in range(rings + 1):
-        theta = math.pi * r / rings
-        z = math.cos(theta) * radius
-        rr = math.sin(theta) * radius
-        for s in range(segments):
-            phi = 2 * math.pi * s / segments
-            verts.append((rr * math.cos(phi), rr * math.sin(phi), z))
-    for r in range(rings):
-        for s in range(segments):
-            a = r * segments + s
-            b = r * segments + (s + 1) % segments
-            c = (r + 1) * segments + (s + 1) % segments
-            d = (r + 1) * segments + s
-            faces.append((a, b, c, d))
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _cube_mesh_offset_y(name: str, hx: float, hy: float, hz: float,
-                        offset_y: float):
-    """Cube shifted along +Y by `offset_y` so its base sits at y=0."""
-    me = bpy.data.meshes.new(name)
-    verts = [(x*hx, y*hy + offset_y, z*hz)
-             for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-    faces = [(0,1,3,2),(4,5,7,6),(0,1,5,4),(2,3,7,6),(0,2,6,4),(1,3,7,5)]
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _uv_sphere_mesh_offset_y(name: str, radius: float, offset_y: float,
-                             rings: int = 8, segments: int = 12):
-    """UV sphere centred at (0, offset_y, 0)."""
-    me = bpy.data.meshes.new(name)
-    verts, faces = [], []
-    for r in range(rings + 1):
-        theta = math.pi * r / rings
-        y = math.cos(theta) * radius + offset_y
-        rr = math.sin(theta) * radius
-        for s in range(segments):
-            phi = 2 * math.pi * s / segments
-            verts.append((rr * math.cos(phi), y, rr * math.sin(phi)))
-    for r in range(rings):
-        for s in range(segments):
-            a = r * segments + s
-            b = r * segments + (s + 1) % segments
-            c = (r + 1) * segments + (s + 1) % segments
-            d = (r + 1) * segments + s
-            faces.append((a, b, c, d))
-    me.from_pydata(verts, [], faces)
-    me.update()
-    return me
-
-
-def _enter_object_mode(context):
-    """Force OBJECT mode; return the previous mode key so callers can restore.
-
-    Blender's rigid-body / selection ops all require OBJECT mode context.
-    User may click our buttons from Pose Mode or Edit Mode — silently
-    switch, do the work, switch back.
-    """
-    prev = context.mode
-    if prev == "OBJECT":
-        return prev
-    # context.mode gives verbose names like 'POSE' / 'EDIT_ARMATURE' /
-    # 'EDIT_MESH'; mode_set takes 'OBJECT' / 'POSE' / 'EDIT' etc. The
-    # verbose form ALSO works for the return trip because Blender maps it.
-    try:
-        bpy.ops.object.mode_set(mode="OBJECT")
-    except Exception:  # noqa: BLE001
-        pass
-    return prev
-
-
-def _restore_mode(context, prev_mode: str):
-    if prev_mode in (None, "", "OBJECT"):
-        return
-    # 'EDIT_MESH' / 'EDIT_ARMATURE' -> 'EDIT'; 'PAINT_WEIGHT' etc. stay.
-    target = "EDIT" if prev_mode.startswith("EDIT_") else prev_mode
-    try:
-        bpy.ops.object.mode_set(mode=target)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _deselect_all(context):
-    """Pure-API deselect — safe from any mode."""
-    for o in context.view_layer.objects:
+    def __exit__(self, *exc):
+        if self.prev == "OBJECT":
+            return
         try:
-            o.select_set(False)
+            self.context.view_layer.objects.active = self.active
+            bpy.ops.object.mode_set(mode="EDIT" if self.prev.startswith("EDIT") else self.prev)
         except (RuntimeError, ReferenceError):
             pass
 
 
-def _apply_rigid_body(context, obj, kind: str, blender_shape: str,
-                      friction: float = 0.5, restitution: float = 0.0,
-                      mass: float = 1.0, kinematic: bool = False):
-    prev_mode = _enter_object_mode(context)
-    try:
-        _deselect_all(context)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        if obj.rigid_body is None:
-            bpy.ops.rigidbody.object_add(type=kind)
+class at_rest:
+    """Hold the scene on the simulation's first frame so bodies are read at rest."""
+
+    def __init__(self, context):
+        self.scene = context.scene
+
+    def __enter__(self):
+        self.frame = self.scene.frame_current
+        rbw = self.scene.rigidbody_world
+        start = rbw.point_cache.frame_start if rbw is not None else self.scene.frame_start
+        if self.frame != start:
+            self.scene.frame_set(start)
         else:
-            obj.rigid_body.type = kind
-        rb = obj.rigid_body
-        rb.collision_shape = blender_shape
-        rb.friction = friction
-        rb.restitution = restitution
-        rb.mass = max(mass, 0.001)
-        rb.kinematic = kinematic
-    finally:
-        _restore_mode(context, prev_mode)
+            self.frame = None
+
+    def __exit__(self, *exc):
+        if self.frame is not None:
+            self.scene.frame_set(self.frame)
 
 
-def _apply_constraint(context, empty, con_type: str, obj_a, obj_b):
-    prev_mode = _enter_object_mode(context)
-    try:
-        _deselect_all(context)
-        empty.select_set(True)
-        context.view_layer.objects.active = empty
-        if empty.rigid_body_constraint is None:
-            bpy.ops.rigidbody.constraint_add(type=con_type)
-        else:
-            empty.rigid_body_constraint.type = con_type
-        con = empty.rigid_body_constraint
-        con.enabled = True
-        con.object1 = obj_a
-        con.object2 = obj_b
-    finally:
-        _restore_mode(context, prev_mode)
+def _bone_direction(arm, bone, preferred=()):
+    """Armature-space vector along which a body on ``bone`` should lie. Imported
+    M2 bones all point the same way, so the next joint's pivot is what counts."""
+    head = bone.head_local
+    children = [c for c in bone.children if (c.head_local - head).length > 1e-4]
+    pick = next((c for c in children if c.name in preferred), None) \
+        or (children[0] if children else None)
+    if pick is not None:
+        return pick.head_local - head
+    if bone.parent is not None and (head - bone.parent.head_local).length > 1e-4:
+        return head - bone.parent.head_local
+    return bone.tail_local - head
 
 
-def _index_bodies_by_bone(coll):
-    """{bone_name: body_obj} — includes both bone-parented bodies (root
-    anchors etc.) and dynamic bodies that carry the m2_phys_bone_name
-    custom prop from the bone_preset operator."""
-    out = {}
-    if coll is None:
-        return out
-    for obj in coll.objects:
-        if obj.rigid_body is None:
+def _weighted_points(arm, bone_name, min_weight=0.4):
+    """Armature-space positions of the mesh vertices this bone drives."""
+    arm_inv = arm.matrix_world.inverted()
+    pts = []
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or phys_rig.is_rig_object(obj) or obj.get("m2_bounding_box"):
             continue
-        name = ""
-        if obj.parent_type == "BONE" and obj.parent_bone:
-            name = obj.parent_bone
+        if not (obj.parent == arm or any(m.type == "ARMATURE" and m.object == arm
+                                         for m in obj.modifiers)):
+            continue
+        vg = obj.vertex_groups.get(bone_name)
+        if vg is None:
+            continue
+        gi = vg.index
+        to_arm = arm_inv @ obj.matrix_world
+        for v in obj.data.vertices:
+            for g in v.groups:
+                if g.group == gi:
+                    if g.weight >= min_weight:
+                        pts.append(to_arm @ v.co)
+                    break
+    return pts
+
+
+def _fit_to_mesh(arm, bone, outward):
+    """Fit (centre, axis, half-length, radius) to the bone's skinned vertices,
+    or None when the bone drives too little mesh to measure."""
+    pts = _weighted_points(arm, bone.name)
+    if len(pts) < 8:
+        return None
+    import numpy as np
+    P = np.array([tuple(p) for p in pts], dtype=float)
+    c = P.mean(axis=0)
+    Q = P - c
+    _, vecs = np.linalg.eigh(Q.T @ Q)
+    axis = vecs[:, -1]
+    if float(np.dot(axis, np.array(tuple(outward)))) < 0.0:
+        axis = -axis
+    proj = Q @ axis
+    lo, hi = float(proj.min()), float(proj.max())
+    radial = np.linalg.norm(Q - np.outer(proj, axis), axis=1)
+    r = float(np.percentile(radial, 90))
+    centre = Vector(c) + Vector(axis) * ((lo + hi) * 0.5)
+    return centre, Vector(axis), (hi - lo) * 0.5, max(r, 0.003)
+
+
+def _is_chain_bone(bone):
+    return any((c.head_local - bone.head_local).length > 1e-4 for c in bone.children)
+
+
+def _make_bone_body(context, coll, arm, bone, body_type, kind, radius, preferred=()):
+    """A body on ``bone``. Shapes are fitted to the mesh the bone deforms when
+    it has one: a chain bone gets a capsule along the chain with the mesh's
+    thickness, a leaf bone (a breast, an ear, a tassel tip) gets a shape
+    sitting on the flesh itself rather than projected out along the bone."""
+    props_scene = context.scene.m2_physics
+    direction = _bone_direction(arm, bone, preferred)
+    length = max(direction.length, 0.01)
+    unit = direction.normalized() if direction.length > 1e-6 else Vector((0, 0, 1))
+    head = bone.head_local
+    world = arm.matrix_world @ Matrix.Translation(head)
+    prefix = {"ROOT": "phys_body_root", "KINEMATIC": "phys_coll_"}.get(body_type, "phys_body_")
+    name = prefix if body_type == "ROOT" else prefix + bone.name
+    obj = phys_rig.new_body(context, coll, name, world, body_type, bone.name)
+    if body_type == "ROOT":
+        phys_rig.rebuild_body(context, obj)
+        return obj, unit
+
+    is_chain = _is_chain_bone(bone)
+    fit = _fit_to_mesh(arm, bone, unit)
+    if fit is not None and not is_chain:
+        centre, axis, half_len, r = fit
+        unit = axis
+        r = radius or props_scene.radius or r
+        local_c = centre - head
+        if kind == "SPHERE" or (kind == "CAPSULE" and half_len < 1.2 * r):
+            phys_rig.add_shape(obj, "SPHERE", p1=local_c, radius=max(r, half_len * 0.8))
+        elif kind == "CAPSULE":
+            phys_rig.add_shape(obj, "CAPSULE", p1=local_c - axis * (half_len - r),
+                               p2=local_c + axis * (half_len - r), radius=r)
         else:
-            name = obj.get("m2_phys_bone_name", "") or ""
-        if name:
-            out.setdefault(name, obj)
-    return out
-
-
-def _make_shape_mesh_at_bone(name: str, arm_obj, pose_bone, shape: str,
-                             radius: float):
-    """Return (mesh, blender_shape_str, world_matrix).
-
-    The mesh is built IN the bone's local frame (origin = bone head,
-    +Y = bone axis), so the returned world matrix is EXACTLY the bone's
-    rest world matrix. When Copy Transforms copies the body back to the
-    bone, the bone lands at its original rest pose (no leaked rotation
-    or offset from mesh construction)."""
-    length = max(pose_bone.bone.length, 0.01)
-    if shape == "CAPSULE":
-        me = _cylinder_mesh(name + "_mesh", radius=radius, height=length,
-                            along_y=True)
-        bshape = "CAPSULE"
-    elif shape == "BOX":
-        # Box centred on the bone: half-length in Y, half-thickness in X/Z.
-        # We build the geometry from -length/2 to +length/2 in Y and then
-        # shift up so the base sits at y=0 (bone head-aligned).
-        me = _cube_mesh_offset_y(name + "_mesh",
-                                 hx=radius, hy=length * 0.5, hz=radius,
-                                 offset_y=length * 0.5)
-        bshape = "BOX"
+            axes = phys_rig.matrix_to_mat3x4(phys_rig.frame_from_z(axis).to_4x4())[0:9]
+            phys_rig.add_shape(obj, "BOX", p1=local_c, box_axes=axes,
+                               half_extents=(r, r, max(half_len, r)))
     else:
-        # Sphere centred at bone midpoint (y = length/2).
-        me = _uv_sphere_mesh_offset_y(name + "_mesh", radius=radius,
-                                      offset_y=length * 0.5)
-        bshape = "SPHERE"
-
-    # REST pose matrix — bone.matrix_local is the rest bone matrix in
-    # armature space (origin=head, +Y along bone). We MUST use rest, not
-    # `pose_bone.matrix`, so the body's initial pose is stable regardless
-    # of what animation frame the user is on when clicking the preset.
-    bone_world = arm_obj.matrix_world @ pose_bone.bone.matrix_local
-    return me, bshape, bone_world
-
-
-def _bone_parent_keeping_transform(obj, arm_obj, pose_bone):
-    """Bone-parent obj such that its current world matrix is preserved.
-
-    Blender's `parent_type='BONE'` uses the bone TAIL as parent origin,
-    so we compute matrix_parent_inverse = tail_world⁻¹ @ obj.world.
-    """
-    length = max(pose_bone.bone.length, 0.01)
-    bone_world = arm_obj.matrix_world @ pose_bone.matrix
-    tail_world = bone_world @ Matrix.Translation((0.0, length, 0.0))
-    world = obj.matrix_world.copy()
-    obj.parent = arm_obj
-    obj.parent_type = "BONE"
-    obj.parent_bone = pose_bone.name
-    obj.matrix_parent_inverse = tail_world.inverted() @ world
+        r = radius or props_scene.radius or (fit[3] if fit is not None
+                                              else max(0.005, min(length * 0.2, 0.08)))
+        if not is_chain and fit is None:
+            length = min(length, max(r * 2.0, 0.02))      # leaf bone with no mesh to measure
+        if kind == "CAPSULE":
+            inset = min(r, length * 0.25)
+            phys_rig.add_shape(obj, "CAPSULE", p1=unit * inset, p2=unit * (length - inset), radius=r)
+        elif kind == "SPHERE":
+            phys_rig.add_shape(obj, "SPHERE", p1=unit * (length * 0.5), radius=max(r, length * 0.5))
+        else:
+            axes = phys_rig.matrix_to_mat3x4(phys_rig.frame_from_z(unit).to_4x4())[0:9]
+            phys_rig.add_shape(obj, "BOX", p1=unit * (length * 0.5), box_axes=axes,
+                               half_extents=(r, r, length * 0.5))
+    phys_rig.rebuild_body(context, obj)
+    return obj, unit
 
 
-def _make_shape_mesh_at_cursor(name: str, context, shape: str, radius: float):
-    if shape == "CAPSULE":
-        me = _cylinder_mesh(name + "_mesh", radius=radius, height=radius * 4)
-        bshape = "CAPSULE"
-    elif shape == "BOX":
-        me = _cube_mesh(name + "_mesh", hx=radius, hy=radius, hz=radius)
-        bshape = "BOX"
-    else:
-        me = _uv_sphere_mesh(name + "_mesh", radius=radius)
-        bshape = "SPHERE"
-    mtx = Matrix.Translation(context.scene.cursor.location)
-    return me, bshape, mtx
-
-
-def _resolve_armature(context, pose_bone=None, hint=None):
-    """Find the armature to attach to. Priority:
-       1. explicit hint (bone_preset passes this so the loop can't lose it)
-       2. pose_bone.id_data → its armature object (walks scene objects)
-       3. active object / selection / context.object
-    Falls back to None so callers can decide whether to error or spawn at cursor."""
-    if hint is not None and hint.type == "ARMATURE":
-        return hint
-    if pose_bone is not None:
-        arm_data = pose_bone.id_data  # bpy.types.Armature
-        for o in bpy.data.objects:
-            if o.type == "ARMATURE" and o.data is arm_data:
-                return o
-    return _get_active_armature(context)
-
-
-def _add_body_common(context, is_active: bool, pose_bone=None,
-                     preset: str = None, arm=None):
-    """Shared body-add path. Uses the given pose_bone (or the active one)."""
-    _ensure_world(context)
-    arm = _resolve_armature(context, pose_bone=pose_bone, hint=arm)
-    props = context.scene.m2_physics
-    coll = _phys_collection(context, _model_name(context))
-
-    pb = pose_bone
-    if pb is None and arm is not None and context.mode == "POSE":
-        pb = context.active_pose_bone
-
-    if pb is not None and arm is not None:
-        me, bshape, world = _make_shape_mesh_at_bone(
-            "phys_" + ("body" if is_active else "coll") + "_" + pb.name,
-            arm, pb, props.shape_type, float(props.default_radius))
-        print(f"[m2phys] placing body '{me.name}' on bone '{pb.name}' — "
-              f"world head={world.translation}", flush=True)
-    else:
-        prefix = "phys_body" if is_active else "phys_coll"
-        me, bshape, world = _make_shape_mesh_at_cursor(
-            prefix, context, props.shape_type, float(props.default_radius))
-        print(f"[m2phys] no bone / no armature (pose_bone={pose_bone}, "
-              f"pb={pb}, arm={arm}, mode={context.mode}) — falling back to cursor",
-              flush=True)
-
-    obj = bpy.data.objects.new(me.name.rsplit("_mesh", 1)[0], me)
-    coll.objects.link(obj)
-    obj.display_type = "WIRE"
-    # Decompose to loc/rot/scale — setting matrix_world directly sometimes
-    # doesn't survive the depsgraph flush a rigidbody.object_add op triggers.
-    loc, rot, scale = world.decompose()
-    obj.location = loc
-    obj.rotation_mode = "QUATERNION"
-    obj.rotation_quaternion = rot
-    obj.scale = scale
-    obj["m2_phys_body_type"] = int(
-        phys.BODY_DYNAMIC if is_active else phys.BODY_KINEMATIC)
-    obj["_m2_phys_blender_shape"] = bshape
-
-    # Root/collision bodies (passive) are bone-parented so they follow the
-    # armature. Dynamic bodies stay UNPARENTED — the sim needs them free
-    # to move, and bone-parenting would create a feedback loop with the
-    # bone's Copy Transforms follow-constraint.
-    if pb is not None and arm is not None and not is_active:
-        _bone_parent_keeping_transform(obj, arm, pb)
-
-    _apply_rigid_body(
-        context, obj,
-        kind="ACTIVE" if is_active else "PASSIVE",
-        blender_shape=bshape,
-        friction=0.5, restitution=0.0, mass=1.0,
-        kinematic=not is_active,
-    )
-
-    # Record which bone this body corresponds to, for export + the wire-bone
-    # step (the object itself is not bone-parented when dynamic, so we can't
-    # read the bone from parent_bone).
-    if pb is not None:
-        obj["m2_phys_bone_name"] = pb.name
-
-    # Select the new body so its per-object controls appear immediately.
-    prev_mode = _enter_object_mode(context)
-    try:
-        _deselect_all(context)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-    finally:
-        _restore_mode(context, prev_mode)
+def _anchor_for(context, coll, arm, bone):
+    """The body a chain starting at ``bone`` should hang from, made if needed."""
+    ancestor = bone.parent
+    while ancestor is not None:
+        body = phys_rig.body_for_bone(coll, ancestor.name)
+        if body is not None:
+            return body
+        ancestor = ancestor.parent
+    root = phys_rig.root_body(coll)
+    from . import from_scene
+    anchor_bone = bone.parent or from_scene._topo_bones(arm.data)[0]
+    if anchor_bone == bone:
+        anchor_bone = next((b for b in arm.data.bones if b != bone), bone)
+    if root is None:
+        return _make_bone_body(context, coll, arm, anchor_bone, "ROOT", "CAPSULE", 0.0)[0]
+    if root.m2_phys_body.bone == anchor_bone.name or bone.parent is None:
+        return root
+    existing = phys_rig.body_for_bone(coll, anchor_bone.name)
+    if existing is not None:
+        return existing
+    # A second chain hanging off a different bone: a shapeless kinematic body
+    # there, so the chain follows THAT bone instead of the root's.
+    obj = phys_rig.new_body(context, coll, "phys_coll_" + anchor_bone.name,
+                            arm.matrix_world @ Matrix.Translation(anchor_bone.head_local),
+                            "KINEMATIC", anchor_bone.name)
+    phys_rig.rebuild_body(context, obj)
     return obj
 
 
-def _add_weld(context, coll, body_a, body_b):
-    """Fully-rigid WELD joint (Blender FIXED). Rare — use _add_point_joint
-    for anything that should swing."""
-    idx = sum(1 for o in coll.objects
-              if o.get("m2_phys_joint_type") == int(phys.JOINT_WELD))
-    empty = bpy.data.objects.new(f"phys_join_weld_{idx:02d}", None)
-    empty.empty_display_type = "PLAIN_AXES"
-    empty.empty_display_size = 0.02
-    coll.objects.link(empty)
-    empty["m2_phys_joint_type"] = int(phys.JOINT_WELD)
-    a = body_a.matrix_world.translation
-    b = body_b.matrix_world.translation
-    empty.location = (a + b) * 0.5
-    _apply_constraint(context, empty, "FIXED", body_a, body_b)
-    return empty
+def _connect(context, coll, arm, body_a, body_b, joint_type, z_axis=None, **values):
+    world_b = phys_rig.body_frame_world(body_b)
+    if z_axis is None:
+        z_axis = world_b.translation - phys_rig.body_frame_world(body_a).translation
+    rot = (arm.matrix_world.to_3x3() if arm is not None else Matrix.Identity(3)) \
+        @ phys_rig.frame_from_z(z_axis)
+    world = Matrix.Translation(world_b.translation) @ rot.normalized().to_4x4()
+    name = "phys_joint_" + (body_b.m2_phys_body.bone or body_b.name)
+    return phys_rig.new_joint(context, coll, name, world, body_a, body_b, joint_type, **values)
 
 
-def _add_spring_joint(context, coll, body_a, body_b, pivot_world: Vector,
-                      lin_limit: float, ang_limit_deg: float,
-                      stiffness: float, damping: float):
-    """GENERIC_SPRING joint at pivot_world with small allowed offset and a
-    spring that pulls back to rest — the physical setup for breast /
-    belly / ponytail jiggle.
-
-    IMPORTANT: Blender's GENERIC_SPRING rest is the CONSTRAINT EMPTY's
-    origin (in the constraint's local frame). So the empty MUST sit at
-    body_b's origin, with matching orientation — otherwise the spring
-    pulls body_b AWAY from its initial pose toward wherever the empty is.
-
-    Exports as SHOULDER (SHOJ) in the .phys since it's the closest kind
-    WoW's Domino engine supports for spring-limited joints."""
-    idx = sum(1 for o in coll.objects
-              if o.get("m2_phys_joint_type") == int(phys.JOINT_SHOULDER))
-    empty = bpy.data.objects.new(f"phys_join_spring_{idx:02d}", None)
-    empty.empty_display_type = "PLAIN_AXES"
-    empty.empty_display_size = 0.03
-    coll.objects.link(empty)
-    empty["m2_phys_joint_type"] = int(phys.JOINT_SHOULDER)
-    # Align the constraint frame to body_b's world matrix — spring rest
-    # is then body_b's initial pose exactly.
-    empty.matrix_world = body_b.matrix_world.copy()
-    empty["m2_phys_pivot_hint"] = list(pivot_world)  # kept for export
-
-    _apply_constraint(context, empty, "GENERIC_SPRING", body_a, body_b)
-
-    con = empty.rigid_body_constraint
-    ang = math.radians(ang_limit_deg)
-    # Translation: limit ± lin_limit around rest, spring pulls back.
-    for axis in ("x", "y", "z"):
-        setattr(con, f"use_limit_lin_{axis}", True)
-        setattr(con, f"limit_lin_{axis}_lower", -lin_limit)
-        setattr(con, f"limit_lin_{axis}_upper", +lin_limit)
-        setattr(con, f"use_spring_{axis}", True)
-        setattr(con, f"spring_stiffness_{axis}", stiffness)
-        setattr(con, f"spring_damping_{axis}", damping)
-    # Rotation: soft angular limits so it can wobble a bit.
-    for axis in ("x", "y", "z"):
-        setattr(con, f"use_limit_ang_{axis}", True)
-        setattr(con, f"limit_ang_{axis}_lower", -ang)
-        setattr(con, f"limit_ang_{axis}_upper", +ang)
-        # Angular spring: added in Blender 3.0. Named differently across
-        # versions — try each naming, log if none work.
-        wired_ang = False
-        for name_use, name_stf, name_dmp in (
-            (f"use_spring_ang_{axis}",
-             f"spring_stiffness_ang_{axis}",
-             f"spring_damping_ang_{axis}"),
-            # some builds use singular prefix
-            (f"use_angular_spring_{axis}",
-             f"angular_spring_stiffness_{axis}",
-             f"angular_spring_damping_{axis}"),
-        ):
-            if hasattr(con, name_use):
-                setattr(con, name_use, True)
-                setattr(con, name_stf, stiffness * 0.5)
-                setattr(con, name_dmp, damping)
-                wired_ang = True
-                break
-        if not wired_ang:
-            print(f"[m2phys] no angular spring API on this Blender build "
-                  f"for axis {axis}; rotation will only be limited", flush=True)
-    return empty
+def _topo_sorted(bones):
+    def depth(b):
+        d = 0
+        while b.parent is not None:
+            d, b = d + 1, b.parent
+        return d
+    return sorted(bones, key=lambda b: (depth(b), b.name))
 
 
-def _add_point_joint(context, coll, body_a, body_b, pivot_world: Vector):
-    """POINT / spherical joint (free rotation, no translation) at
-    `pivot_world`. Standard for cloth/hair/chain — bodies pivot freely
-    about the joint anchor. Exports as SPHJ (SPHERICAL) in the .phys."""
-    idx = sum(1 for o in coll.objects
-              if o.get("m2_phys_joint_type") == int(phys.JOINT_SPHERICAL))
-    empty = bpy.data.objects.new(f"phys_join_point_{idx:02d}", None)
-    empty.empty_display_type = "PLAIN_AXES"
-    empty.empty_display_size = 0.02
-    coll.objects.link(empty)
-    empty["m2_phys_joint_type"] = int(phys.JOINT_SPHERICAL)
-    empty.location = pivot_world
-    _apply_constraint(context, empty, "POINT", body_a, body_b)
-    return empty
+def _refresh(context, coll):
+    phys_rig.apply_self_collision(coll, context.scene.m2_physics.self_collision)
+    phys_rig.sanitize_constraints(context.scene, context.view_layer)
+    phys_rig.reset_simulation(context)
 
 
-def _wire_bone_to_body(pose_bone, body_obj):
-    """Make the bone rotate to match the physics body. Uses Damped Track
-    so the bone tracks the body's origin — this is the standard bone-
-    physics recipe and doesn't have the space-conversion ambiguities
-    that Copy Rotation on bones can trip over. The body is built along
-    the bone axis with its origin at the bone HEAD, so the natural
-    'track' direction is +Y = bone axis. As the body swings, its origin
-    stays roughly at the bone head, but its ROTATION shifts — Damped
-    Track uses the body's rotated +Y as the target direction, giving the
-    correct bone follow.
-
-    Falls back to Copy Rotation if that turns out not to work in
-    testing."""
-    for c in list(pose_bone.constraints):
-        if c.name.startswith("m2phys_"):
-            pose_bone.constraints.remove(c)
-
-    # Copy Rotation, POSE space owner — cleanest way to force the bone's
-    # effective rotation to equal the body's world rotation while still
-    # keeping the bone's head anchored to its parent bone.
-    c = pose_bone.constraints.new("COPY_ROTATION")
-    c.name = "m2phys_follow"
-    c.target = body_obj
-    c.owner_space = "POSE"
-    c.target_space = "WORLD"
-    c.influence = 1.0
-    print(f"[m2phys] wired bone '{pose_bone.name}' Copy Rotation -> "
-          f"body '{body_obj.name}' (owner=POSE, target=WORLD)", flush=True)
-    return c
+def _begin_edit(context, coll=None):
+    """Every operator that changes the rig starts here: stop the preview so
+    Bullet is idle, and drop the bone-follow constraints so the skeleton is
+    back at rest while we measure and rebuild."""
+    phys_rig.stop_playback(context)
+    if coll is None:
+        coll = phys_rig.find_rig(context)
+    if coll is not None:
+        phys_rig.clear_follow(coll.m2_phys_rig.armature, coll)
+    context.scene.frame_set(context.scene.frame_start)
 
 
-def _is_phys_body(obj) -> bool:
-    if obj is None or obj.rigid_body is None:
+def _previewing(arm) -> bool:
+    if arm is None or arm.pose is None:
         return False
-    return any(c.name.endswith(PHYS_COLLECTION_SUFFIX)
-               for c in obj.users_collection)
-
-
-def _is_phys_joint(obj) -> bool:
-    if obj is None or obj.rigid_body_constraint is None:
-        return False
-    return any(c.name.endswith(PHYS_COLLECTION_SUFFIX)
-               for c in obj.users_collection)
+    return any(c.name == phys_rig.FOLLOW_CONSTRAINT
+               for pb in arm.pose.bones for c in pb.constraints)
 
 
 # ---------------------------------------------------------------------------
-# Operators
+# Operators: building
 # ---------------------------------------------------------------------------
-
-class M2PHYS_OT_add_physics_mesh(Operator):
-    bl_idname = "m2phys.add_physics_mesh"
-    bl_label = "Add Physics Mesh"
-    bl_description = ("Create a DYNAMIC body attached to the active pose bone "
-                      "(falls, gets pushed around by the sim). If no bone is "
-                      "active, drops one at the 3D cursor")
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        obj = _add_body_common(context, is_active=True)
-        self.report({"INFO"}, "Added physics mesh '%s'" % obj.name)
-        return {"FINISHED"}
-
-
-class M2PHYS_OT_add_collision_mesh(Operator):
-    bl_idname = "m2phys.add_collision_mesh"
-    bl_label = "Add Collision Mesh"
-    bl_description = ("Create a PASSIVE/kinematic body attached to the active "
-                      "pose bone (drives collisions but is not moved by the "
-                      "sim itself — great as an anchor or a bone-driven "
-                      "collider that other bodies bounce off)")
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        obj = _add_body_common(context, is_active=False)
-        self.report({"INFO"}, "Added collision mesh '%s'" % obj.name)
-        return {"FINISHED"}
-
-
-_PRESETS = {
-    # Light, high air-drag, soft-ish so it drapes and settles.
-    "CLOTH":  dict(mass=0.10, friction=0.70, restitution=0.00,
-                   linear_damping=0.40, angular_damping=0.60,
-                   joint="POINT"),
-    # Heavier metal links, low damping so they swing freely; slight bounce.
-    "CHAIN":  dict(mass=1.50, friction=0.40, restitution=0.05,
-                   linear_damping=0.10, angular_damping=0.15,
-                   joint="POINT"),
-    # Standalone bouncy body: no joint, high restitution. Needs a
-    # collider mesh (character body, ground) to bounce off.
-    "BOUNCE": dict(mass=0.50, friction=0.20, restitution=0.90,
-                   linear_damping=0.04, angular_damping=0.10,
-                   joint="NONE"),
-    # Breast / belly / ponytail jiggle: body springs back to rest with
-    # small displacement, damped so it doesn't oscillate forever.
-    # Gravity ON so the preview shows immediate motion (small ~5mm sag
-    # at rest given the stiffness). If that sag annoys you, turn it off
-    # via the body's Rigid Body panel — the spring alone will hold it.
-    "JIGGLE": dict(mass=0.20, friction=0.30, restitution=0.00,
-                   linear_damping=0.35, angular_damping=0.55,
-                   use_gravity=True,
-                   joint="SPRING",
-                   spring_lin_limit=0.05,     # ±5cm translation
-                   spring_ang_limit_deg=25.0, # ±25° rotation
-                   spring_stiffness=800.0,    # snappy return (heavier vs gravity)
-                   spring_damping=15.0),
-}
-
-
-def _apply_preset_to(obj, preset: dict):
-    """Push preset numbers into obj.rigid_body AND the m2_phys_* mirror props."""
-    if obj.rigid_body is None:
-        return False
-    rb = obj.rigid_body
-    rb.mass = preset["mass"]
-    rb.friction = preset["friction"]
-    rb.restitution = preset["restitution"]
-    rb.linear_damping = preset["linear_damping"]
-    rb.angular_damping = preset["angular_damping"]
-    # Some presets (JIGGLE) turn gravity off so the body rests exactly at
-    # its parent's motion instead of sagging under gravity.
-    rb.enabled = True
-    try:
-        rb.use_gravity = bool(preset.get("use_gravity", True))
-    except AttributeError:
-        pass
-    obj["m2_phys_density"] = preset["mass"]
-    obj["m2_phys_friction"] = preset["friction"]
-    obj["m2_phys_restitution"] = preset["restitution"]
-    return True
-
 
 class M2PHYS_OT_bone_preset(Operator):
-    """One-shot: select bone(s) → click preset → everything set up correctly.
-
-    Adds a body on each selected pose bone (skipping bones that already
-    have one), auto-welds each new body to the nearest ancestor bone's
-    body, creates a root anchor on the top-most bone's parent if the rig
-    has no root yet, and applies the preset numbers to every created or
-    already-existing body on the selection.
-    """
+    """Rig the selected pose bones in one click: a body on each bone, joints
+    between them, and a root anchor if the rig doesn't have one"""
     bl_idname = "m2phys.bone_preset"
-    bl_label = "Preset to Bone"
-    bl_description = ("Select one or more pose bones and click a preset — the "
-                      "capsules, root anchor, and welds are all created and "
-                      "tuned in one go")
+    bl_label = "Rig Selected Bones"
     bl_options = {"REGISTER", "UNDO"}
 
-    preset: EnumProperty(
-        items=[("CLOTH", "Cloth", ""),
-               ("CHAIN", "Chain", ""),
-               ("BOUNCE", "Bounce", ""),
-               ("JIGGLE", "Jiggle", "")],
-        default="CLOTH",
-    )
+    preset: EnumProperty(items=[("CLOTH", "Cloth", "Swings in a cone with drag: cloaks, tabards, hair"),
+                                ("CHAIN", "Chain", "Free-swinging links: chains, pendants"),
+                                ("JIGGLE", "Jiggle", "Springs back to rest: stiff cloth, ears, tails"),
+                                ("BODY", "Soft Body", "Gentle bounce for chest, belly and other soft parts")])
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "POSE" and bool(context.selected_pose_bones)
 
     def execute(self, context):
-        arm = _get_active_armature(context)
-        if arm is None:
-            self.report({"ERROR"}, "No active armature")
-            return {"CANCELLED"}
-        if context.mode != "POSE":
-            self.report({"ERROR"}, "Enter Pose Mode and select at least one bone")
-            return {"CANCELLED"}
-        selected = list(context.selected_pose_bones or [])
-        if not selected:
-            self.report({"ERROR"}, "Select at least one pose bone")
-            return {"CANCELLED"}
-
-        _ensure_world(context)
-        coll = _phys_collection(context, _model_name(context))
-        by_bone = _index_bodies_by_bone(coll)
-
-        # Sort selection by parent-chain depth (roots first) so auto-weld
-        # can always find a parent body already-built.
-        def depth(pb):
-            n, cur = 0, pb.parent
-            while cur is not None:
-                n += 1
-                cur = cur.parent
-            return n
-        ordered = sorted(selected, key=depth)
-
-        # Ensure a root anchor. If none exists, put one on the parent of
-        # the top-most selected bone (or on the top-most bone itself if
-        # it has no parent).
-        root = next((o for o in coll.objects if o.get("m2_phys_root")), None)
-        if root is None:
-            top_pb = ordered[0]
-            root_pb = top_pb.parent if top_pb.parent is not None else top_pb
-            root = _add_body_common(context, is_active=False, pose_bone=root_pb, arm=arm)
-            root["m2_phys_root"] = True
-            root["m2_phys_body_type"] = int(phys.BODY_ROOT)
-            # Root is passive + kinematic (follows the bone).
-            _apply_rigid_body(
-                context, root, kind="PASSIVE",
-                blender_shape=root.get("_m2_phys_blender_shape", "BOX"),
-                friction=0.5, restitution=0.0, mass=1.0, kinematic=True,
-            )
-            by_bone = _index_bodies_by_bone(coll)
-
-        # Create a body for every selected bone that doesn't have one.
-        # POINT joint (spherical) placed at the bone HEAD connects each
-        # body to the parent-chain body — this is what lets it swing.
-        # Copy Transforms bone constraint makes the bone follow the body
-        # in real time (no bake needed).
-        created = []
-        for pb in ordered:
-            existing = by_bone.get(pb.name)
-            if existing is not None:
-                created.append(existing)
-                continue
-            body = _add_body_common(context, is_active=True, pose_bone=pb, arm=arm)
-            created.append(body)
-            by_bone[pb.name] = body
-
-            # Find the closest ancestor with a body (skipping bones the
-            # user didn't select — matches Blender's parent chain).
-            parent_body = None
-            cur = pb.parent
-            while cur is not None and parent_body is None:
-                parent_body = by_bone.get(cur.name)
-                cur = cur.parent
-            if parent_body is None:
-                parent_body = root
-
-            # Joint at bone HEAD (world, rest pose) — the natural pivot.
-            # Preset chooses the constraint kind: POINT for chain/cloth,
-            # GENERIC_SPRING for jiggle (springs back), none for bounce.
-            head_world = arm.matrix_world @ pb.bone.head_local
-            joint_kind = _PRESETS[self.preset].get("joint", "POINT")
-            if parent_body is not None and joint_kind != "NONE":
-                if joint_kind == "SPRING":
-                    p = _PRESETS[self.preset]
-                    _add_spring_joint(
-                        context, coll, parent_body, body, head_world,
-                        lin_limit=p["spring_lin_limit"],
-                        ang_limit_deg=p["spring_ang_limit_deg"],
-                        stiffness=p["spring_stiffness"],
-                        damping=p["spring_damping"],
-                    )
+        arm = context.active_object
+        names = [pb.name for pb in context.selected_pose_bones]
+        joint_type, joint_values, body_values, shape_values, mass, shape_kind = _PRESETS[self.preset]
+        kind = shape_kind or context.scene.m2_physics.shape_kind
+        made = 0
+        with _object_mode(context), at_rest(context):
+            _begin_edit(context, phys_rig.find_rig(context, arm))
+            coll = phys_rig.ensure_rig(context, arm)
+            for bone in _topo_sorted([arm.data.bones[n] for n in names]):
+                body = phys_rig.body_for_bone(coll, bone.name)
+                if body is not None and body.m2_phys_body.body_type != "DYNAMIC":
+                    self.report({"WARNING"}, "'%s' already has a %s body; skipped"
+                                % (bone.name, body.m2_phys_body.body_type.lower()))
+                    continue
+                anchor = _anchor_for(context, coll, arm, bone)
+                if body is None:
+                    body, unit = _make_bone_body(context, coll, arm, bone, "DYNAMIC", kind, 0.0, names)
+                    _connect(context, coll, arm, anchor, body, joint_type,
+                             z_axis=unit, **joint_values)
+                    made += 1
                 else:
-                    _add_point_joint(context, coll, parent_body, body, head_world)
-
-            # Wire this bone to the body so the viewport shows motion.
-            _wire_bone_to_body(pb, body)
-
-        # Apply the tuned numbers to everything we just touched.
-        p = _PRESETS[self.preset]
-        for o in created:
-            _apply_preset_to(o, p)
-
-        self.report(
-            {"INFO"},
-            "%s: %d bodies (root '%s')"
-            % (self.preset.title(), len(created),
-               root.name if root is not None else "none"),
-        )
+                    for j in phys_rig.joints_of(coll, body):
+                        if j.m2_phys_joint.body_b == body:
+                            with phys_rig.suppress_updates():
+                                j.m2_phys_joint.joint_type = joint_type
+                                for k, v in joint_values.items():
+                                    setattr(j.m2_phys_joint, k, v)
+                            phys_rig.sync_constraint(context, j)
+                with phys_rig.suppress_updates():
+                    for k, v in body_values.items():
+                        setattr(body.m2_phys_body, k, v)
+                    for s in body.m2_phys_body.shapes:
+                        for k, v in shape_values.items():
+                            setattr(s, k, v)
+                phys_rig.set_body_mass(body, mass)
+                phys_rig.rebuild_body(context, body)
+            for body in phys_rig.rig_bodies(coll):    # anchors depend on the set of dynamic bones
+                phys_rig.rebuild_body(context, body)
+            for j in phys_rig.rig_joints(coll):       # spring strength depends on mass
+                phys_rig.sync_constraint(context, j)
+            _refresh(context, coll)
+        self.report({"INFO"}, "%s: %d new bodies on %d bones (build %s)"
+                    % (self.preset.title(), made, len(names), phys_rig.BUILD))
         return {"FINISHED"}
 
 
-class M2PHYS_OT_apply_preset(Operator):
-    bl_idname = "m2phys.apply_preset"
-    bl_label = "Apply Preset"
-    bl_description = "Apply a tuned physics preset to every selected body"
+class M2PHYS_OT_add_body(Operator):
+    """Add one body on the active pose bone"""
+    bl_idname = "m2phys.add_body"
+    bl_label = "Add Body"
     bl_options = {"REGISTER", "UNDO"}
 
-    preset: EnumProperty(
-        name="Preset",
-        items=[
-            ("CLOTH",  "Cloth",
-             "Light, drapes and settles: mass 0.1, friction 0.7, damping 0.4/0.6"),
-            ("CHAIN",  "Chain",
-             "Metal chain link: mass 1.5, friction 0.4, low damping, slight bounce"),
-            ("BOUNCE", "Bounce",
-             "Bouncy ball: restitution 0.9, low friction, low damping"),
-        ],
-        default="CLOTH",
-    )
+    body_type: EnumProperty(items=[i for i in phys_rig.BODY_TYPE_ITEMS if i[0] != "ROOT"],
+                            default="DYNAMIC")
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "POSE" and context.active_pose_bone is not None
 
     def execute(self, context):
-        bodies = [o for o in context.selected_objects if _is_phys_body(o)]
-        if not bodies:
-            self.report({"ERROR"}, "Select at least one physics body")
+        arm = context.active_object
+        bone = arm.data.bones[context.active_pose_bone.name]
+        with _object_mode(context), at_rest(context):
+            _begin_edit(context, phys_rig.find_rig(context, arm))
+            coll = phys_rig.ensure_rig(context, arm)
+            if self.body_type == "DYNAMIC" and phys_rig.body_for_bone(coll, bone.name) is not None:
+                self.report({"ERROR"}, "Bone '%s' already has a body." % bone.name)
+                return {"CANCELLED"}
+            obj, _ = _make_bone_body(context, coll, arm, bone, self.body_type,
+                                     context.scene.m2_physics.shape_kind, 0.0)
+            _refresh(context, coll)
+        self.report({"INFO"}, "Added %s. Connect it to another body with a joint." % obj.name)
+        return {"FINISHED"}
+
+
+class M2PHYS_OT_connect(Operator):
+    """Join the two selected bodies. The active body becomes the child"""
+    bl_idname = "m2phys.connect"
+    bl_label = "Connect Selected"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len([o for o in context.selected_objects if phys_rig.is_body(o)]) == 2 \
+            and phys_rig.is_body(context.active_object)
+
+    def execute(self, context):
+        child = context.active_object
+        parent = next(o for o in context.selected_objects
+                      if phys_rig.is_body(o) and o != child)
+        coll = next((c for c in child.users_collection if c.m2_phys_rig.is_rig), None)
+        if coll is None or coll not in parent.users_collection:
+            self.report({"ERROR"}, "Both bodies must belong to the same rig.")
             return {"CANCELLED"}
-        p = _PRESETS[self.preset]
-        n = 0
-        for o in bodies:
-            if _apply_preset_to(o, p):
-                n += 1
-        self.report({"INFO"}, "%s preset applied to %d body(ies)"
-                    % (self.preset.title(), n))
-        return {"FINISHED"}
-
-
-class M2PHYS_OT_make_collider(Operator):
-    """Turn each selected mesh object into a PASSIVE physics collider so
-    the sim's dynamic bodies actually bounce off it. Use for:
-      • the character mesh itself (add a Convex Hull for whole-body collision)
-      • a ground plane
-      • static props / environment meshes
-
-    The mesh is NOT moved into the phys collection — it stays in its home
-    collection. Set collision_shape to MESH (exact geometry, slower) or
-    CONVEX_HULL (fast, approximate)."""
-    bl_idname = "m2phys.make_collider"
-    bl_label = "Make Collider"
-    bl_description = ("Add a PASSIVE Rigid Body to every selected mesh so "
-                      "physics capsules collide with it. Use Convex Hull for "
-                      "speed, or Mesh for exact geometry")
-    bl_options = {"REGISTER", "UNDO"}
-
-    shape: EnumProperty(
-        name="Collision Shape",
-        items=[
-            ("CONVEX_HULL", "Convex Hull",
-             "Fast, wraps the mesh in a convex volume — good default"),
-            ("MESH", "Mesh (exact)",
-             "Uses the actual mesh geometry — slower but exact"),
-        ],
-        default="CONVEX_HULL",
-    )
-
-    def execute(self, context):
-        _ensure_world(context)
-        meshes = [o for o in context.selected_objects
-                  if o.type == "MESH" and not _is_phys_body(o)]
-        if not meshes:
-            self.report({"ERROR"}, "Select at least one mesh object "
-                                    "(not already a physics body)")
+        if any(j.m2_phys_joint.body_a in (child, parent) and j.m2_phys_joint.body_b in (child, parent)
+               for j in phys_rig.rig_joints(coll)):
+            self.report({"ERROR"}, "These two bodies are already connected.")
             return {"CANCELLED"}
-        for obj in meshes:
-            _apply_rigid_body(
-                context, obj, kind="PASSIVE",
-                blender_shape=self.shape,
-                friction=0.5, restitution=0.0, mass=1.0,
-                kinematic=True,   # animate/pose freely; sim still collides
-            )
-            obj["m2_phys_collider"] = True
-        self.report({"INFO"}, "Made %d mesh(es) into collider(s) (%s)"
-                    % (len(meshes), self.shape))
+        _begin_edit(context, coll)
+        with at_rest(context):
+            frame = phys_rig.body_frame_world(child)
+            z_axis = (frame @ phys_rig.body_com_local(child)) - frame.translation
+            _connect(context, coll, coll.m2_phys_rig.armature, parent, child,
+                     context.scene.m2_physics.joint_type,
+                     z_axis=z_axis if z_axis.length > 1e-5 else None)
+            _refresh(context, coll)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_unmake_collider(Operator):
-    bl_idname = "m2phys.unmake_collider"
-    bl_label = "Remove Collider"
-    bl_description = "Strip the collider Rigid Body from selected meshes"
+class M2PHYS_OT_set_root(Operator):
+    """Make the active body the rig's Root Anchor (written first in the file).
+    The old root becomes an ordinary anchor; both follow their bones"""
+    bl_idname = "m2phys.set_root"
+    bl_label = "Make Root Anchor"
     bl_options = {"REGISTER", "UNDO"}
 
-    def execute(self, context):
-        n = 0
-        prev_mode = _enter_object_mode(context)
-        try:
-            for obj in context.selected_objects:
-                if obj.get("m2_phys_collider") and obj.rigid_body is not None:
-                    _deselect_all(context)
-                    obj.select_set(True)
-                    context.view_layer.objects.active = obj
-                    try:
-                        bpy.ops.rigidbody.object_remove()
-                    except RuntimeError:
-                        pass
-                    try:
-                        del obj["m2_phys_collider"]
-                    except KeyError:
-                        pass
-                    n += 1
-        finally:
-            _restore_mode(context, prev_mode)
-        self.report({"INFO"}, "Removed collider from %d mesh(es)" % n)
-        return {"FINISHED"}
-
-
-class M2PHYS_OT_connect_selected(Operator):
-    bl_idname = "m2phys.connect_selected"
-    bl_label = "Connect Selected (Weld)"
-    bl_description = "Weld the two selected physics bodies together"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        sel = [o for o in context.selected_objects if _is_phys_body(o)]
-        if len(sel) != 2:
-            self.report({"ERROR"}, "Select exactly two physics bodies")
-            return {"CANCELLED"}
-        coll = next(
-            (c for o in sel for c in o.users_collection
-             if c.name.endswith(PHYS_COLLECTION_SUFFIX)),
-            _phys_collection(context, _model_name(context)),
-        )
-        _add_weld(context, coll, sel[0], sel[1])
-        self.report({"INFO"}, "Welded %s <-> %s" % (sel[0].name, sel[1].name))
-        return {"FINISHED"}
-
-
-class M2PHYS_OT_mark_root(Operator):
-    bl_idname = "m2phys.mark_root"
-    bl_label = "Mark as Root Anchor"
-    bl_description = ("Turn the active body into the phys ROOT anchor "
-                      "(PASSIVE + kinematic; only ONE per rig)")
-    bl_options = {"REGISTER", "UNDO"}
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.is_body(context.active_object)
 
     def execute(self, context):
         obj = context.active_object
-        if not _is_phys_body(obj):
-            self.report({"ERROR"}, "Select a physics body first")
-            return {"CANCELLED"}
-        # Clear existing roots in the same phys collection.
-        for c in obj.users_collection:
-            if c.name.endswith(PHYS_COLLECTION_SUFFIX):
-                for other in c.objects:
-                    if other is not obj:
-                        try:
-                            del other["m2_phys_root"]
-                        except KeyError:
-                            pass
-        obj["m2_phys_root"] = True
-        obj["m2_phys_body_type"] = int(phys.BODY_ROOT)
-        _apply_rigid_body(
-            context, obj, kind="PASSIVE",
-            blender_shape=obj.get("_m2_phys_blender_shape", "BOX"),
-            friction=obj.rigid_body.friction,
-            restitution=obj.rigid_body.restitution,
-            mass=obj.rigid_body.mass,
-            kinematic=True,
-        )
-        self.report({"INFO"}, "Marked '%s' as root" % obj.name)
+        coll = next((c for c in obj.users_collection if c.m2_phys_rig.is_rig), None)
+        _begin_edit(context, coll)
+        with at_rest(context):
+            for other in (phys_rig.rig_bodies(coll) if coll else []):
+                if other != obj and other.m2_phys_body.body_type == "ROOT":
+                    other.m2_phys_body.body_type = "KINEMATIC"
+            obj.m2_phys_body.body_type = "ROOT"
+            if coll is not None:
+                _refresh(context, coll)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_delete_body(Operator):
-    bl_idname = "m2phys.delete_body"
-    bl_label = "Delete Selected Physics Object"
-    bl_description = "Remove the selected body / joint from the phys rig"
+class M2PHYS_OT_add_shape(Operator):
+    """Add another shape to the active body"""
+    bl_idname = "m2phys.add_shape"
+    bl_label = "Add Shape"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.is_body(context.active_object)
+
     def execute(self, context):
-        removed = 0
-        for obj in list(context.selected_objects):
-            if _is_phys_body(obj) or _is_phys_joint(obj):
-                bpy.data.objects.remove(obj, do_unlink=True)
-                removed += 1
-        self.report({"INFO"}, "Removed %d object(s)" % removed)
+        obj = context.active_object
+        _begin_edit(context)
+        shapes = obj.m2_phys_body.shapes
+        kind = context.scene.m2_physics.shape_kind
+        values = {}
+        if shapes:                         # start from the last shape's material
+            last = shapes[-1]
+            values = dict(friction=last.friction, restitution=last.restitution,
+                          density=last.density)
+        phys_rig.add_shape(obj, kind, **values)
+        phys_rig.rebuild_body(context, obj)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_preview_bake(Operator):
-    bl_idname = "m2phys.preview_bake"
-    bl_label = "Bake Preview & Wire Bones"
-    bl_description = ("Bake the rigid-body sim to keyframes across the frame "
-                      "range, then add Copy Transforms bone constraints so "
-                      "bones follow the baked physics. Use Rebuild Physics "
-                      "afterwards to keep editing the setup")
+class M2PHYS_OT_remove_shape(Operator):
+    """Remove this shape from the body"""
+    bl_idname = "m2phys.remove_shape"
+    bl_label = "Remove Shape"
     bl_options = {"REGISTER", "UNDO"}
 
+    index: bpy.props.IntProperty()
+
     def execute(self, context):
-        props = context.scene.m2_physics
-        arm = _get_active_armature(context)
-        if arm is None:
-            self.report({"ERROR"}, "Need an active armature")
+        obj = context.active_object
+        if not phys_rig.is_body(obj) or not 0 <= self.index < len(obj.m2_phys_body.shapes):
             return {"CANCELLED"}
-        rbw = context.scene.rigidbody_world
-        if rbw is None:
-            self.report({"ERROR"}, "No Rigid Body World — add a body first")
-            return {"CANCELLED"}
-        coll = _find_phys_collection(context)
-        if coll is None:
-            self.report({"ERROR"}, "No phys collection")
-            return {"CANCELLED"}
-
-        bodies = [o for o in coll.objects
-                  if o.rigid_body is not None and o.rigid_body.type == "ACTIVE"]
-        if not bodies:
-            self.report({"WARNING"}, "No ACTIVE bodies to bake")
-            return {"CANCELLED"}
-
-        # Break bone-parent-driven depsgraph cycles before the bake.
-        # Cycle shape (from the .phys import path + a preset that adds
-        # a Copy Rotation constraint on a bone):
-        #   Sim → active body → bone parent → constrained bone → body
-        # Unparenting an ACTIVE body while KEEPING its world transform
-        # cuts the loop at the "bone parent" edge. We stash the bone
-        # name on the object so the .phys exporter still knows which
-        # bone this body corresponds to.
-        broken = 0
-        for o in bodies:
-            if o.parent_type != "BONE" or not o.parent_bone:
-                continue
-            bone_name = o.parent_bone
-            world = o.matrix_world.copy()
-            o["m2_phys_bone_name"] = bone_name
-            o.parent = None
-            o.matrix_world = world
-            broken += 1
-        if broken:
-            print(f"[m2phys] preview_bake: unparented {broken} active "
-                  f"body(ies) from their bones to break sim cycles "
-                  f"(bone name preserved via m2_phys_bone_name prop)",
-                  flush=True)
-
-        rbw.point_cache.frame_start = int(props.preview_start)
-        rbw.point_cache.frame_end = int(props.preview_end)
-        context.scene.frame_start = int(props.preview_start)
-        context.scene.frame_end = int(props.preview_end)
-
-        prev_mode = _enter_object_mode(context)
-        try:
-            _deselect_all(context)
-            for o in bodies:
-                o.select_set(True)
-            context.view_layer.objects.active = bodies[0]
-            try:
-                bpy.ops.rigidbody.bake_to_keyframes(
-                    frame_start=int(props.preview_start),
-                    frame_end=int(props.preview_end),
-                    step=1,
-                )
-            except RuntimeError as exc:
-                self.report({"ERROR"}, "bake_to_keyframes failed: %s" % exc)
-                return {"CANCELLED"}
-        finally:
-            _restore_mode(context, prev_mode)
-
-        wired = 0
-        for body in bodies:
-            # Prefer live bone-parenting; fall back to the imported /
-            # cycle-broken bodies' m2_phys_bone_name stash.
-            if body.parent_type == "BONE" and body.parent_bone:
-                bname = body.parent_bone
-            else:
-                bname = str(body.get("m2_phys_bone_name", "") or "")
-            if not bname:
-                continue
-            pb = arm.pose.bones.get(bname)
-            if pb is None:
-                continue
-            for c in list(pb.constraints):
-                if c.name.startswith("m2phys_preview"):
-                    pb.constraints.remove(c)
-            c = pb.constraints.new("COPY_TRANSFORMS")
-            c.name = "m2phys_preview"
-            c.target = body
-            c.influence = 1.0
-            wired += 1
-
-        self.report({"INFO"}, "Baked %d bodies, wired %d bones" % (len(bodies), wired))
+        _begin_edit(context)
+        obj.m2_phys_body.shapes.remove(self.index)
+        phys_rig.rebuild_body(context, obj)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_preview_clear(Operator):
-    bl_idname = "m2phys.preview_clear"
-    bl_label = "Clear Preview"
-    bl_description = "Remove Copy Transforms bone constraints from preview bake"
+class M2PHYS_OT_fit_to_bone(Operator):
+    """Put the body back on its bone and fit its first shape to the mesh the
+    bone deforms (or lay it along the bone when it drives no mesh)"""
+    bl_idname = "m2phys.fit_to_bone"
+    bl_label = "Fit to Mesh"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.is_body(context.active_object)
+
     def execute(self, context):
-        arm = _get_active_armature(context)
-        if arm is None:
-            self.report({"ERROR"}, "No armature")
+        obj = context.active_object
+        props = obj.m2_phys_body
+        arm = phys_rig._rig_armature(obj)
+        bone = arm.data.bones.get(props.bone) if arm is not None else None
+        if bone is None:
+            self.report({"ERROR"}, "Assign a bone first.")
             return {"CANCELLED"}
-        n = 0
-        for pb in arm.pose.bones:
-            for c in list(pb.constraints):
-                if c.name.startswith("m2phys_preview"):
-                    pb.constraints.remove(c)
-                    n += 1
-        self.report({"INFO"}, "Removed %d preview constraint(s)" % n)
+        _begin_edit(context)
+        with at_rest(context):
+            direction = _bone_direction(arm, bone)
+            length = max(direction.length, 0.01)
+            unit = direction.normalized()
+            phys_rig.set_body_frame_world(
+                obj, arm.matrix_world @ Matrix.Translation(bone.head_local))
+            fit = None if _is_chain_bone(bone) else _fit_to_mesh(arm, bone, unit)
+            with phys_rig.suppress_updates():
+                props.has_file_position = False
+                for shape in props.shapes:
+                    if fit is not None:
+                        centre, axis, half_len, r = fit
+                        local_c = centre - bone.head_local
+                        if shape.kind == "CAPSULE":
+                            reach = max(half_len - shape.radius, 0.0)
+                            shape.p1, shape.p2 = local_c - axis * reach, local_c + axis * reach
+                        else:
+                            shape.p1 = local_c
+                    elif shape.kind == "CAPSULE":
+                        inset = min(shape.radius, length * 0.25)
+                        shape.p1, shape.p2 = unit * inset, unit * (length - inset)
+                    break
+            phys_rig.rebuild_body(context, obj)
+            phys_rig.reset_simulation(context)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_rebuild(Operator):
-    bl_idname = "m2phys.rebuild"
-    bl_label = "Rebuild Physics from Data"
-    bl_description = ("Restore Rigid Body settings on every object in the "
-                      "phys collection from the stored m2_phys_* custom "
-                      "properties (undoes a preview bake so you can keep "
-                      "editing)")
+class M2PHYS_OT_delete(Operator):
+    """Delete the selected bodies (with their joints) and joints"""
+    bl_idname = "m2phys.delete"
+    bl_label = "Delete Selected"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        return any(phys_rig.is_body(o) or phys_rig.is_joint(o) for o in context.selected_objects)
+
     def execute(self, context):
-        coll = _find_phys_collection(context)
-        if coll is None:
-            self.report({"ERROR"}, "No phys collection")
-            return {"CANCELLED"}
-        _ensure_world(context)
-        n = 0
-        for obj in coll.objects:
-            if obj.data is None:
-                continue  # joint empties
-            body_type = int(obj.get("m2_phys_body_type", phys.BODY_DYNAMIC))
-            is_root = bool(obj.get("m2_phys_root", False))
-            shape = obj.get("_m2_phys_blender_shape", "BOX")
-            friction = float(obj.get("m2_phys_friction", 0.5))
-            rest = float(obj.get("m2_phys_restitution", 0.0))
-            density = float(obj.get("m2_phys_density", 1.0))
-            _apply_rigid_body(
-                context, obj,
-                kind=("PASSIVE" if is_root or body_type != phys.BODY_DYNAMIC
-                      else "ACTIVE"),
-                blender_shape=shape,
-                friction=friction, restitution=rest, mass=density,
-                kinematic=is_root,
-            )
-            n += 1
-        self.report({"INFO"}, "Rebuilt %d body(ies)" % n)
+        _begin_edit(context)
+        doomed = set()
+        colls = set()
+        for obj in context.selected_objects:
+            if phys_rig.is_joint(obj):
+                doomed.add(obj)
+            elif phys_rig.is_body(obj):
+                doomed.add(obj)
+                for coll in obj.users_collection:
+                    if coll.m2_phys_rig.is_rig:
+                        doomed.update(phys_rig.joints_of(coll, obj))
+            colls.update(c for c in obj.users_collection if c.m2_phys_rig.is_rig)
+        for coll in colls:
+            phys_rig.clear_follow(coll.m2_phys_rig.armature, coll)
+        n = len(doomed)
+        for obj in doomed:
+            phys_rig.remove_object(obj)
+        phys_rig.reset_simulation(context)
+        self.report({"INFO"}, "Deleted %d object(s)." % n)
         return {"FINISHED"}
 
 
-class M2PHYS_OT_remove_all(Operator):
-    bl_idname = "m2phys.remove_all"
-    bl_label = "Remove All Physics"
-    bl_description = "Delete the entire phys collection and everything inside"
+class M2PHYS_OT_remove_rig(Operator):
+    """Delete the whole physics rig"""
+    bl_idname = "m2phys.remove_rig"
+    bl_label = "Remove Physics Rig"
     bl_options = {"REGISTER", "UNDO"}
 
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.find_rig(context) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
     def execute(self, context):
-        coll = _find_phys_collection(context)
-        if coll is None:
-            self.report({"INFO"}, "Nothing to remove")
-            return {"CANCELLED"}
-        for o in list(coll.objects):
-            bpy.data.objects.remove(o, do_unlink=True)
+        coll = phys_rig.find_rig(context)
+        _begin_edit(context, coll)
+        for obj in list(coll.objects):
+            phys_rig.remove_object(obj)
         bpy.data.collections.remove(coll)
-        self.report({"INFO"}, "All physics removed")
+        phys_rig.reset_simulation(context)
         return {"FINISHED"}
 
 
-# ---------------------------------------------------------------------------
-# Panel — content depends on what's selected
-# ---------------------------------------------------------------------------
-
-class M2PHYS_OT_reveal_rig_collection(Operator):
-    """Un-hide a phys collection and select its members so the user can
-    actually see the imported rig in the viewport. Fixes 'the import
-    said it worked but I don't see anything' by removing the two
-    common causes: collection is view-layer excluded, or its members
-    are hide-viewport'd."""
-
-    bl_idname = "m2phys.reveal_rig_collection"
-    bl_label = "Reveal Rig"
-    bl_description = ("Unhide the selected phys collection + all its members, "
-                      "select them, and frame the viewport on the rig.")
+class M2PHYS_OT_select_rig(Operator):
+    """Unhide the rig, select it and frame it in the viewport"""
+    bl_idname = "m2phys.select_rig"
+    bl_label = "Show Rig"
     bl_options = {"REGISTER", "UNDO"}
 
-    collection_name: bpy.props.StringProperty()
+    collection_name: StringProperty()
 
     def execute(self, context):
         coll = bpy.data.collections.get(self.collection_name)
         if coll is None:
-            self.report({"WARNING"}, f"Collection {self.collection_name!r} not found")
             return {"CANCELLED"}
+
+        def unexclude(layer):
+            if layer.collection == coll:
+                layer.exclude = False
+                layer.hide_viewport = False
+            for child in layer.children:
+                unexclude(child)
+        unexclude(context.view_layer.layer_collection)
         coll.hide_viewport = False
-        coll.hide_select = False
-        # Un-exclude from the active view layer if it's excluded.
-        vl = context.view_layer
-        def _find(layer_coll, target):
-            if layer_coll.collection == target:
-                return layer_coll
-            for ch in layer_coll.children:
-                r = _find(ch, target)
-                if r is not None:
-                    return r
-            return None
-        lc = _find(vl.layer_collection, coll)
-        if lc is not None:
-            lc.exclude = False
-            lc.hide_viewport = False
-        # Un-hide + select every object in the collection.
-        for obj in coll.objects:
-            obj.hide_viewport = False
-            obj.hide_set(False)
-            obj.select_set(True)
-        # Set an active object so the panel's per-body / per-joint sections
-        # can start showing something useful.
-        if coll.objects:
-            context.view_layer.objects.active = coll.objects[0]
-        # Frame the viewport on the selection if we can.
-        for area in context.screen.areas:
-            if area.type == "VIEW_3D":
-                for region in area.regions:
-                    if region.type == "WINDOW":
-                        with context.temp_override(area=area, region=region):
-                            try:
-                                bpy.ops.view3d.view_selected(use_all_regions=False)
-                            except RuntimeError:
-                                pass
-                break
-        self.report({"INFO"},
-                    f"Revealed {coll.name} ({len(coll.objects)} object(s))")
+        with _object_mode(context):
+            for o in context.view_layer.objects:
+                o.select_set(False)
+            for o in coll.objects:
+                if o.get("m2_phys_follow_helper"):
+                    continue
+                o.hide_set(False)
+                o.hide_viewport = False
+                o.select_set(True)
         return {"FINISHED"}
 
+
+# ---------------------------------------------------------------------------
+# Operators: preview
+# ---------------------------------------------------------------------------
+
+class M2PHYS_OT_preview_start(Operator):
+    """Simulate the rig and make the skeleton follow it, so the model moves the
+    way it will in game. Assign an animation to the armature first to see the
+    rig react to movement"""
+    bl_idname = "m2phys.preview_start"
+    bl_label = "Start Preview"
+
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.find_rig(context) is not None
+
+    def execute(self, context):
+        coll = phys_rig.find_rig(context)
+        errors, warnings = phys_from_scene.validate(coll)
+        if errors:
+            self.report({"ERROR"}, errors[0])
+            return {"CANCELLED"}
+        phys_rig.stop_playback(context)
+        phys_rig.ensure_world(context)
+        arm = coll.m2_phys_rig.armature
+        phys_rig.clear_follow(arm, coll)
+        context.scene.frame_set(context.scene.frame_start)
+        # Hidden bodies drop out of the simulation and their joints would
+        # point at nothing: unhide the rig so what you see is what runs.
+        for obj in phys_rig.rig_bodies(coll) + phys_rig.rig_joints(coll):
+            try:
+                obj.hide_set(False)
+            except RuntimeError:
+                pass
+            obj.hide_viewport = False
+        phys_rig.apply_self_collision(coll, context.scene.m2_physics.self_collision)
+        phys_rig.sanitize_constraints(context.scene, context.view_layer)
+        phys_rig.reset_simulation(context)
+        wired = phys_rig.wire_follow(coll)
+        try:
+            bpy.ops.screen.animation_play()
+        except RuntimeError:
+            pass
+        msg = "Preview running (build %s): %d bones follow their bodies." % (phys_rig.BUILD, wired)
+        if warnings:
+            msg += " " + warnings[0]
+        self.report({"WARNING"} if warnings else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class M2PHYS_OT_preview_stop(Operator):
+    """Stop the preview and put the skeleton back"""
+    bl_idname = "m2phys.preview_stop"
+    bl_label = "Stop Preview"
+
+    def execute(self, context):
+        phys_rig.stop_playback(context)
+        for coll in phys_rig.rig_collections():
+            phys_rig.clear_follow(coll.m2_phys_rig.armature, coll)
+        context.scene.frame_set(context.scene.frame_start)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Operators: files
+# ---------------------------------------------------------------------------
+
+class M2PHYS_OT_import_phys(Operator, ImportHelper):
+    """Load a .phys file onto the active armature, replacing its current rig"""
+    bl_idname = "m2phys.import_phys"
+    bl_label = "Import .phys"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".phys"
+    filter_glob: StringProperty(default="*.phys", options={"HIDDEN"})
+    mirror_x: BoolProperty(name="Mirror X", default=False,
+                           description="Match the setting the model was imported with")
+
+    def execute(self, context):
+        arm = phys_rig.active_armature(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select the model's armature first.")
+            return {"CANCELLED"}
+        name = os.path.splitext(os.path.basename(self.filepath))[0]
+        _begin_edit(context)
+        with _object_mode(context):
+            label = phys_to_scene.load_phys_into_scene(
+                context, "", arm, name, mirror_x=self.mirror_x, explicit_path=self.filepath)
+        if label is None:
+            self.report({"ERROR"}, "No physics bodies found in that file.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Imported physics from %s" % os.path.basename(self.filepath))
+        return {"FINISHED"}
+
+
+class M2PHYS_OT_export_phys(Operator, ExportHelper):
+    """Write just the physics rig to a .phys file"""
+    bl_idname = "m2phys.export_phys"
+    bl_label = "Export .phys"
+
+    filename_ext = ".phys"
+    filter_glob: StringProperty(default="*.phys", options={"HIDDEN"})
+    mirror_x: BoolProperty(name="Mirror X", default=False,
+                           description="Match the setting the model was imported with")
+
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.find_rig(context) is not None
+
+    def execute(self, context):
+        coll = phys_rig.find_rig(context)
+        try:
+            with at_rest(context):
+                data = phys_from_scene.build_phys_bytes(
+                    context, coll.m2_phys_rig.armature, mirror_x=self.mirror_x, collection=coll)
+        except phys_from_scene.RigError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        with open(self.filepath, "wb") as f:
+            f.write(data)
+        self.report({"INFO"}, "Wrote %s (%d bytes)" % (os.path.basename(self.filepath), len(data)))
+        return {"FINISHED"}
+
+
+class M2PHYS_OT_validate(Operator):
+    """Check the rig for problems that would break it in game"""
+    bl_idname = "m2phys.validate"
+    bl_label = "Check Rig"
+
+    @classmethod
+    def poll(cls, context):
+        return phys_rig.find_rig(context) is not None
+
+    def execute(self, context):
+        errors, warnings = phys_from_scene.validate(phys_rig.find_rig(context))
+        for e in errors:
+            self.report({"ERROR"}, e)
+        for w in warnings:
+            self.report({"WARNING"}, w)
+        if not errors and not warnings:
+            self.report({"INFO"}, "Rig is valid and ready to export.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
 
 class VIEW3D_PT_m2_physics(Panel):
     bl_space_type = "VIEW_3D"
@@ -1280,219 +812,219 @@ class VIEW3D_PT_m2_physics(Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.m2_physics
-
-        # --- Imported / detected rig status ------------------------------
-        # Tells the user at a glance whether a .phys was loaded alongside
-        # the .m2 (the M2 loader auto-calls load_phys_into_scene) and how
-        # many bodies/joints landed in the scene. Without this box the
-        # only signal was "there's a `<name>_phys` collection in the
-        # outliner" — easy to miss when the collection is collapsed.
-        self._draw_rig_status(layout, context)
-
-        # --- One-click bone preset (the primary workflow) ----------------
-        n_sel_bones = (len(context.selected_pose_bones)
-                       if context.mode == "POSE" and context.selected_pose_bones
-                       else 0)
-        box = layout.box()
-        box.label(text="Preset to Selected Bone(s)", icon="BONE_DATA")
-        grid = box.column(align=True)
-        grid.enabled = n_sel_bones > 0
-        row = grid.row(align=True)
-        row.operator("m2phys.bone_preset", text="Cloth", icon="MOD_CLOTH").preset = "CLOTH"
-        row.operator("m2phys.bone_preset", text="Chain", icon="LINKED").preset = "CHAIN"
-        row = grid.row(align=True)
-        row.operator("m2phys.bone_preset", text="Jiggle", icon="FORCE_HARMONIC").preset = "JIGGLE"
-        row.operator("m2phys.bone_preset", text="Bounce", icon="FORCE_FORCE").preset = "BOUNCE"
-        if n_sel_bones == 0:
-            box.label(text="→ enter Pose Mode + select bones",
-                      icon="INFO")
-        else:
-            box.label(text=f"{n_sel_bones} bone(s) selected",
-                      icon="CHECKMARK")
-
-        layout.separator()
-
-        # --- Colliders on existing meshes --------------------------------
-        box = layout.box()
-        box.label(text="Selected mesh → collider:", icon="MOD_PHYSICS")
-        row = box.row(align=True)
-        row.operator("m2phys.make_collider", text="Make Collider (Hull)"
-                     ).shape = "CONVEX_HULL"
-        row = box.row(align=True)
-        row.operator("m2phys.make_collider", text="Exact Mesh Collider"
-                     ).shape = "MESH"
-        row.operator("m2phys.unmake_collider", text="", icon="X")
-
-        layout.separator()
-
-        # --- Manual add-mesh (advanced) ----------------------------------
-        col = layout.column(align=True)
-        col.label(text="Manual Add:")
-        row = col.row(align=True)
-        row.prop(props, "shape_type", text="")
-        row.prop(props, "default_radius", text="Size")
-        row = col.row(align=True)
-        row.operator("m2phys.add_physics_mesh", icon="RIGID_BODY", text="Physics Mesh")
-        row.operator("m2phys.add_collision_mesh", icon="MOD_PHYSICS", text="Collision Mesh")
-
+        scene_props = context.scene.m2_physics
         active = context.active_object
+        coll = phys_rig.find_rig(context)
 
-        # --- Selected body: per-object controls --------------------------
-        if _is_phys_body(active):
-            layout.separator()
-            box = layout.box()
-            box.label(text=f"Body: {active.name}", icon="RIGID_BODY")
-            self._draw_body_controls(box, context, active)
+        self._draw_status(layout, context, coll)
+        if phys_rig.is_body(active):
+            self._draw_body(layout, context, active)
+        elif phys_rig.is_joint(active):
+            self._draw_joint(layout, active)
+        self._draw_build(layout, context, scene_props)
+        if coll is not None:
+            self._draw_preview(layout, context, coll, scene_props)
+            self._draw_files(layout, coll)
 
-        # --- Selected joint: per-joint controls --------------------------
-        elif _is_phys_joint(active):
-            layout.separator()
-            box = layout.box()
-            box.label(text=f"Joint: {active.name}", icon="CONSTRAINT")
-            self._draw_joint_controls(box, context, active)
+    # -- sections ----------------------------------------------------------
 
-        # --- Pose-mode bone hint -----------------------------------------
-        elif context.mode == "POSE" and context.active_pose_bone:
-            layout.separator()
-            box = layout.box()
-            box.label(text=f"Active bone: {context.active_pose_bone.name}",
-                      icon="BONE_DATA")
-            box.label(text="Click 'Add Physics/Collision Mesh' above",
-                      icon="INFO")
-
-        # --- Global status + connect + preview + remove ------------------
-        layout.separator()
-        row = layout.row(align=True)
-        row.operator("m2phys.connect_selected", icon="LINKED")
-        row.operator("m2phys.delete_body", icon="X", text="")
-
-        layout.separator()
+    def _draw_status(self, layout, context, coll):
         box = layout.box()
-        box.label(text="Preview (bake sim -> bones)")
-        row = box.row(align=True)
-        row.prop(props, "preview_start")
-        row.prop(props, "preview_end")
-        col = box.column(align=True)
-        col.operator("m2phys.preview_bake", icon="REC")
-        col.operator("m2phys.preview_clear", icon="CANCEL")
-        col.operator("m2phys.rebuild", icon="FILE_REFRESH")
-
-        layout.separator()
-        layout.operator("m2phys.remove_all", icon="TRASH")
-
-    # --- helpers -----------------------------------------------------
-
-    def _draw_rig_status(self, layout, context):
-        """Show which phys collections exist, how many bodies/joints each
-        contains, and offer quick reveal/hide + jump-in buttons. Helps
-        the user notice that an imported .phys is present but its
-        collection is currently collapsed/hidden."""
-        rig_colls = [c for c in bpy.data.collections
-                     if c.name.endswith(PHYS_COLLECTION_SUFFIX)]
-        if not rig_colls:
-            box = layout.box()
-            row = box.row()
-            row.label(text="No phys rig loaded", icon="INFO")
+        rigs = phys_rig.rig_collections()
+        legacy = [c for c in bpy.data.collections
+                  if c.name.endswith(phys_rig.COLLECTION_SUFFIX) and not c.m2_phys_rig.is_rig
+                  and any(o.rigid_body is not None for o in c.objects)]
+        if legacy:
+            col = box.column(align=True)
+            col.label(text="Old-format rig: %s" % legacy[0].name, icon="ERROR")
+            col.label(text="Made by an earlier version. Delete it and")
+            col.label(text="re-import the physics, or rebuild it here.")
+        if not rigs:
+            box.label(text="No physics rig in this scene", icon="INFO")
+            box.operator("m2phys.import_phys", icon="IMPORT")
             return
-        box = layout.box()
-        box.label(text="Detected Phys Rigs:", icon="RIGID_BODY")
-        for c in rig_colls:
-            n_bodies = sum(1 for o in c.objects if o.rigid_body is not None)
-            n_joints = sum(1 for o in c.objects
-                           if o.rigid_body_constraint is not None)
+        for rig in rigs:
             row = box.row(align=True)
-            row.label(
-                text=f"{c.name}  ({n_bodies} bodies, {n_joints} joints)")
-            # Reveal-in-outliner + select-first-body button.
-            op = row.operator("m2phys.reveal_rig_collection", text="", icon="RESTRICT_SELECT_OFF")
-            op.collection_name = c.name
+            row.label(text="%s: %d bodies, %d joints"
+                      % (rig.name, len(phys_rig.rig_bodies(rig)), len(phys_rig.rig_joints(rig))),
+                      icon="RIGID_BODY" if rig == coll else "DOT")
+            row.operator("m2phys.select_rig", text="", icon="RESTRICT_SELECT_OFF"
+                         ).collection_name = rig.name
 
-    def _draw_body_controls(self, layout, context, obj):
-        rb = obj.rigid_body
-        # Presets — one-click tuning for the two or three shapes people
-        # actually build (soft cloth, swingy chain, bouncy ball).
-        n_selected = sum(1 for o in context.selected_objects if _is_phys_body(o))
-        preset_row = layout.row(align=True)
-        preset_row.label(text=f"Preset (applies to {n_selected}):", icon="PRESET")
-        row = layout.row(align=True)
-        row.operator("m2phys.apply_preset", text="Cloth", icon="MOD_CLOTH").preset = "CLOTH"
-        row.operator("m2phys.apply_preset", text="Chain", icon="LINKED").preset = "CHAIN"
-        row.operator("m2phys.apply_preset", text="Bounce", icon="FORCE_FORCE").preset = "BOUNCE"
-        layout.separator()
-
-        col = layout.column(align=True)
-        col.prop(rb, "type", text="Kind")
-        col.prop(rb, "collision_shape", text="Shape")
-        col.prop(rb, "mass")
-        col.prop(rb, "friction")
-        col.prop(rb, "restitution")
-        col.prop(rb, "linear_damping", text="Linear Damping")
-        col.prop(rb, "angular_damping", text="Angular Damping")
-        col.prop(rb, "kinematic", text="Kinematic (follow parent transform)")
-
-        # Bone parent info (read-only display + bone picker)
-        arm = _get_active_armature(context)
-        if arm is None:
-            arm = obj.parent if (obj.parent and obj.parent.type == "ARMATURE") else None
+    def _draw_body(self, layout, context, obj):
+        props = obj.m2_phys_body
+        box = layout.box()
+        box.label(text=obj.name, icon="RIGID_BODY")
+        col = box.column(align=True)
+        col.prop(props, "body_type")
+        arm = phys_rig._rig_armature(obj)
         if arm is not None:
-            row = layout.row(align=True)
-            row.prop_search(obj, "parent_bone", arm.data, "bones",
-                            text="Bone")
-
-        # Root toggle + delete
-        row = layout.row(align=True)
-        if obj.get("m2_phys_root"):
-            row.label(text="ROOT ANCHOR", icon="PINNED")
+            col.prop_search(props, "bone", arm.data, "bones", text="Bone")
         else:
-            row.operator("m2phys.mark_root", icon="PINNED",
-                         text="Set as Root Anchor")
-        row.operator("m2phys.delete_body", icon="TRASH", text="")
+            col.prop(props, "bone")
+        if props.body_type == "DYNAMIC":
+            col.prop(props, "mass")
+            col.prop(props, "drag")
+        row = box.row(align=True)
+        row.operator("m2phys.fit_to_bone", icon="BONE_DATA")
+        if props.body_type != "ROOT":
+            row.operator("m2phys.set_root", icon="PINNED")
 
-    def _draw_joint_controls(self, layout, context, obj):
-        con = obj.rigid_body_constraint
-        col = layout.column(align=True)
-        col.prop(con, "type", text="Type")
-        col.prop(con, "enabled")
-        col.prop(con, "object1", text="Body A")
-        col.prop(con, "object2", text="Body B")
-        if con.type in {"GENERIC", "GENERIC_SPRING"}:
-            layout.label(text="Limits / spring live in Blender's Physics tab",
-                         icon="INFO")
-        layout.operator("m2phys.delete_body", icon="TRASH", text="Delete Joint")
+        for i, s in enumerate(props.shapes):
+            sbox = box.box()
+            head = sbox.row(align=True)
+            head.prop(s, "kind", text="")
+            head.operator("m2phys.remove_shape", text="", icon="X").index = i
+            if s.kind == "POLYTOPE":
+                sbox.label(text="Geometry is kept from the file", icon="INFO")
+            else:
+                scol = sbox.column(align=True)
+                if s.kind == "CAPSULE":
+                    scol.prop(s, "p1")
+                    scol.prop(s, "p2")
+                    scol.prop(s, "radius")
+                elif s.kind == "SPHERE":
+                    scol.prop(s, "p1", text="Centre")
+                    scol.prop(s, "radius")
+                else:
+                    scol.prop(s, "p1", text="Centre")
+                    scol.prop(s, "half_extents")
+            mat = sbox.column(align=True)
+            mat.prop(s, "friction")
+            mat.prop(s, "restitution")
+            if len(props.shapes) > 1:
+                mat.prop(s, "density")
+        box.operator("m2phys.add_shape", icon="ADD")
+        box.label(text="Move, rotate or scale it freely: export bakes that in.", icon="INFO")
+
+    def _draw_joint(self, layout, empty):
+        props = empty.m2_phys_joint
+        box = layout.box()
+        box.label(text=empty.name, icon="CONSTRAINT")
+        col = box.column(align=True)
+        col.prop(props, "joint_type")
+        col.prop(props, "body_a")
+        col.prop(props, "body_b")
+        col = box.column(align=True)
+        kind = props.joint_type
+        if kind == "SHOULDER":
+            col.prop(props, "cone_angle")
+            col.prop(props, "lower_twist")
+            col.prop(props, "upper_twist")
+            col.separator()
+            col.prop(props, "motor_frequency_hz")
+            col.prop(props, "motor_damping_ratio")
+            col.prop(props, "motor_mode")
+        elif kind == "SPHERICAL":
+            col.prop(props, "friction_torque")
+        elif kind == "WELD":
+            col.prop(props, "angular_frequency_hz")
+            col.prop(props, "angular_damping_ratio")
+            col.prop(props, "linear_frequency_hz")
+            col.prop(props, "linear_damping_ratio")
+        elif kind in ("REVOLUTE", "PRISMATIC"):
+            col.prop(props, "lower_limit")
+            col.prop(props, "upper_limit")
+            col.prop(props, "max_motor_torque")
+            col.prop(props, "motor_mode")
+        else:
+            col.prop(props, "distance_factor")
+        if kind in ("SHOULDER", "REVOLUTE", "PRISMATIC"):
+            box.label(text="The blue Z arrow is the joint's axis.", icon="INFO")
+        if kind in ("REVOLUTE", "PRISMATIC", "DISTANCE"):
+            box.label(text="Preview of this joint type is approximate.", icon="ERROR")
+        if kind == "WELD":
+            box.label(text="Welds did not work on a player model in game.", icon="ERROR")
+            box.label(text="Use Shoulder with Stiffness instead.")
+
+    def _draw_build(self, layout, context, scene_props):
+        box = layout.box()
+        box.label(text="Build", icon="BONE_DATA")
+        if context.mode == "POSE":
+            n = len(context.selected_pose_bones or ())
+            box.label(text="Rig %d selected bone%s as:" % (n, "" if n == 1 else "s"))
+            row = box.row(align=True)
+            row.operator("m2phys.bone_preset", text="Cloth", icon="MOD_CLOTH").preset = "CLOTH"
+            row.operator("m2phys.bone_preset", text="Chain", icon="LINKED").preset = "CHAIN"
+            row.operator("m2phys.bone_preset", text="Jiggle", icon="FORCE_HARMONIC").preset = "JIGGLE"
+            row.operator("m2phys.bone_preset", text="Soft Body", icon="SPHERE").preset = "BODY"
+            row = box.row(align=True)
+            row.operator("m2phys.add_body", text="Add Body", icon="ADD").body_type = "DYNAMIC"
+            row.operator("m2phys.add_body", text="Add Collider", icon="MESH_CAPSULE").body_type = "KINEMATIC"
+        else:
+            box.label(text="Select the armature and enter Pose Mode", icon="INFO")
+            box.label(text="to add bodies to bones.")
+        row = box.row(align=True)
+        row.prop(scene_props, "shape_kind", text="")
+        row.prop(scene_props, "radius")
+        row = box.row(align=True)
+        row.prop(scene_props, "joint_type", text="")
+        row.operator("m2phys.connect", icon="LINKED")
+        box.operator("m2phys.delete", icon="TRASH")
+
+    def _draw_preview(self, layout, context, coll, scene_props):
+        box = layout.box()
+        box.label(text="Preview", icon="PLAY")
+        if _previewing(coll.m2_phys_rig.armature):
+            box.operator("m2phys.preview_stop", icon="PAUSE", depress=True)
+            box.label(text="Stop the preview before editing the rig.", icon="INFO")
+        else:
+            box.operator("m2phys.preview_start", icon="PLAY")
+        box.prop(scene_props, "self_collision")
+        rbw = context.scene.rigidbody_world
+        if rbw is not None:
+            col = box.column(align=True)
+            if hasattr(rbw, "substeps_per_frame"):
+                col.prop(rbw, "substeps_per_frame", text="Substeps")
+            col.prop(rbw, "solver_iterations", text="Solver Iterations")
+
+    def _draw_files(self, layout, coll):
+        box = layout.box()
+        box.label(text="Export", icon="EXPORT")
+        box.prop(coll.m2_phys_rig, "version", text="Format Version")
+        box.operator("m2phys.validate", icon="CHECKMARK")
+        row = box.row(align=True)
+        row.operator("m2phys.import_phys", icon="IMPORT")
+        row.operator("m2phys.export_phys", icon="EXPORT")
+        box.label(text="Exporting the M2 embeds the physics.", icon="INFO")
+        box.label(text="Physics build %s" % phys_rig.BUILD)
+        box.operator("m2phys.remove_rig", icon="TRASH")
 
 
-# ---------------------------------------------------------------------------
 _classes = (
     M2PhysicsProps,
-    M2PHYS_OT_add_physics_mesh,
-    M2PHYS_OT_add_collision_mesh,
     M2PHYS_OT_bone_preset,
-    M2PHYS_OT_apply_preset,
-    M2PHYS_OT_make_collider,
-    M2PHYS_OT_unmake_collider,
-    M2PHYS_OT_connect_selected,
-    M2PHYS_OT_mark_root,
-    M2PHYS_OT_delete_body,
-    M2PHYS_OT_preview_bake,
-    M2PHYS_OT_preview_clear,
-    M2PHYS_OT_rebuild,
-    M2PHYS_OT_remove_all,
-    M2PHYS_OT_reveal_rig_collection,
+    M2PHYS_OT_add_body,
+    M2PHYS_OT_connect,
+    M2PHYS_OT_set_root,
+    M2PHYS_OT_add_shape,
+    M2PHYS_OT_remove_shape,
+    M2PHYS_OT_fit_to_bone,
+    M2PHYS_OT_delete,
+    M2PHYS_OT_remove_rig,
+    M2PHYS_OT_select_rig,
+    M2PHYS_OT_preview_start,
+    M2PHYS_OT_preview_stop,
+    M2PHYS_OT_import_phys,
+    M2PHYS_OT_export_phys,
+    M2PHYS_OT_validate,
     VIEW3D_PT_m2_physics,
 )
 
 
 def register():
-    for c in _classes:
-        bpy.utils.register_class(c)
-    bpy.types.Scene.m2_physics = PointerProperty(type=M2PhysicsProps)
+    phys_rig.register_props()
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.m2_physics = bpy.props.PointerProperty(type=M2PhysicsProps)
 
 
 def unregister():
-    try:
+    if hasattr(bpy.types.Scene, "m2_physics"):
         del bpy.types.Scene.m2_physics
-    except Exception:  # noqa: BLE001
-        pass
-    for c in reversed(_classes):
-        bpy.utils.unregister_class(c)
+    for cls in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
+    phys_rig.unregister_props()

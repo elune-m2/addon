@@ -48,5 +48,5 @@ class LegionParser(BaseM2Parser):
         for i, fid in enumerate(ids):
             if i < len(self.model.textures):
                 self.model.textures[i].file_data_id = fid
-                if not self.model.textures[i].filename:
-                    self.model.textures[i].filename = f"FileDataID_{fid}"
+                # The name stays empty: retail resolves these purely by TXID,
+                # and export must not write a made-up path into the file.

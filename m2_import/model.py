@@ -78,7 +78,7 @@ class M2Sequence:
         "id", "variation_index", "duration", "flags",
         "start_timestamp", "end_timestamp",
         "frequency", "variation_next", "alias_next",
-        "movespeed", "blend_time_in", "blend_time_out",
+        "movespeed", "blend_time_in", "blend_time_out", "bounds",
     )
 
     def __init__(self):
@@ -97,10 +97,15 @@ class M2Sequence:
         self.movespeed = 0.0
         # Cross-fade (ms) into / out of this animation. 0 makes the client snap
         # between animations; retail uses 150 almost everywhere.
-        # Retail stores (in=150, out=0): keep out at 0 so the pair also reads
-        # as a plain uint32 of 150 on clients that treat it as one field.
+        # Two separate uint16s. Retail sets out=0 on ~99% of sequences (the next
+        # animation's blend-in drives the cross-fade) and a real value (20-250)
+        # on a few, e.g. dracthyr/bloodelf anim 1240-1244 use in=150, out=250.
         self.blend_time_in = 150
         self.blend_time_out = 0
+        # Per-animation bounding box ((min), (max), radius) in model space, or
+        # None. Retail keeps these body-sized (Stand ~0.8 x 0.8 x 2.1 m) and the
+        # character screen frames its camera from the current animation's box.
+        self.bounds = None
 
 
 def repair_zero_blend_times(sequences):
@@ -251,9 +256,16 @@ class M2Model:
         self.bounding_min = None    # (x, y, z) in WoW space
         self.bounding_max = None    # (x, y, z)
         self.bounding_radius = 0.0
-        # Set by export when the scene carries an editable bounding-box object;
-        # (min, max) tuple in WoW space. Overrides the vertex-derived bounds.
+        # Collision box: retail characters store a body-sized box here (about
+        # 0.3 m wide, 2 m tall) separate from the much larger render bounds.
+        # The character / transmog screens frame the camera from it.
+        self.collision_min = None
+        self.collision_max = None
+        self.collision_radius = 0.0
+        # Set by export when the scene carries an editable box object;
+        # (min, max) tuple in WoW space. Overrides the stored / derived box.
         self.bounding_override = None
+        self.collision_override = None
         self.skin = None            # M2SkinProfile (LOD 0)
         self.source_path = ""
         # Retail export extras (preserved from the source where available).

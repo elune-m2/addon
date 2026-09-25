@@ -83,15 +83,26 @@ def build_cameras(model, name, mirror_x, collection, fps, log):
         tgt.empty_display_size = 0.1
         collection.objects.link(tgt)
 
-        cobj.location = _conv_pos(cam.position_base, mirror_x)
+        # The camera rides on a rig empty that aims at the target with world Z
+        # up (a plain Damped Track keeps whatever roll the object started with,
+        # which put these cameras on their side). WoW's roll then applies as
+        # the camera's own rotation about its view axis, on top of the aim.
+        rig = bpy.data.objects.new("%s_camrig_%s" % (name, label), None)
+        rig.empty_display_type = "SINGLE_ARROW"
+        rig.empty_display_size = 0.15
+        rig["m2_camera_rig"] = 1
+        collection.objects.link(rig)
+        rig.location = _conv_pos(cam.position_base, mirror_x)
         tgt.location = _conv_pos(cam.target_base, mirror_x)
-
-        con = cobj.constraints.new("DAMPED_TRACK")
+        con = rig.constraints.new("TRACK_TO")
         con.target = tgt
         con.track_axis = "TRACK_NEGATIVE_Z"
+        con.up_axis = "UP_Y"
+        cobj.parent = rig
+        cobj.rotation_mode = "XYZ"
 
         # Animate position / target / roll if the tracks carry keyframes.
-        _keyframe_camera(cobj, tgt, cam, mirror_x, fps)
+        _keyframe_camera(rig, cobj, tgt, cam, mirror_x, fps)
 
         created.append(cobj)
 
@@ -101,20 +112,19 @@ def build_cameras(model, name, mirror_x, collection, fps, log):
     return created
 
 
-def _keyframe_camera(cobj, tgt, cam, mirror_x, fps):
+def _keyframe_camera(rig, cobj, tgt, cam, mirror_x, fps):
     # The position / target tracks are RELATIVE to the base, so the absolute
     pb, tb = cam.position_base, cam.target_base
     pos_keys = _track_keys(cam.position, fps)
     for f, v in pos_keys:
-        cobj.location = _conv_pos((pb[0]+v[0], pb[1]+v[1], pb[2]+v[2]), mirror_x)
-        cobj.keyframe_insert("location", frame=int(round(f)))
+        rig.location = _conv_pos((pb[0]+v[0], pb[1]+v[1], pb[2]+v[2]), mirror_x)
+        rig.keyframe_insert("location", frame=int(round(f)))
     tgt_keys = _track_keys(cam.target, fps)
     for f, v in tgt_keys:
         tgt.location = _conv_pos((tb[0]+v[0], tb[1]+v[1], tb[2]+v[2]), mirror_x)
         tgt.keyframe_insert("location", frame=int(round(f)))
     roll_keys = _track_keys(cam.roll, fps)
-    if roll_keys:
-        cobj.rotation_mode = "YXZ"
+    if roll_keys and any(abs(float(v)) > 1e-6 for _, v in roll_keys):
         for f, v in roll_keys:
             cobj.rotation_euler = (0.0, 0.0, float(v))
             cobj.keyframe_insert("rotation_euler", index=2, frame=int(round(f)))
@@ -506,10 +516,21 @@ def build_animations(model, arm_obj, mirror_x, fps, log, max_animations=0, name=
                 action_max = last if action_max is None else max(action_max, last)
 
         if action_max is None:
-            bpy.data.actions.remove(action)
-            continue
+            # No keys at all. An alias (flag 0x40) borrows another sequence's
+            # data, and an empty variation is a legitimate hold-the-pose clip.
+            # Removing the clip would drop the sequence from the export and
+            # break every alias chain that points at it.
+            action_max = 0.0
 
         action.use_fake_user = True   # keep every clip even when not active
+        # alias_next target as "<id>-<var>", so export can re-point it at
+        # whatever index that sequence ends up with. Retail links both ways:
+        # the alias (flag 0x40) points at its source and the source back at
+        # the alias, so this is stamped whenever the link leaves the clip.
+        tgt = int(getattr(seq, "alias_next", si))
+        if tgt != si and 0 <= tgt < len(sequences):
+            t = sequences[tgt]
+            action["m2_seq_alias"] = "%d-%d" % (int(t.id), int(getattr(t, "variation_index", 0)))
         # Everything export needs to rebuild this sequence lives on the clip
         # itself, so a from-scratch export doesn't have to consult m2_meta.
         action["m2_seq_index"] = si   # map clip back to its sequence on export
@@ -520,6 +541,9 @@ def build_animations(model, arm_obj, mirror_x, fps, log, max_animations=0, name=
         action["m2_seq_blend_time"] = int(getattr(seq, "blend_time_in", 150))
         action["m2_seq_blend_out"] = int(getattr(seq, "blend_time_out", 0))
         action["m2_seq_movespeed"] = float(getattr(seq, "movespeed", 0.0))
+        if getattr(seq, "bounds", None):
+            (bx0, by0, bz0), (bx1, by1, bz1), br = seq.bounds
+            action["m2_seq_bounds"] = [bx0, by0, bz0, bx1, by1, bz1, br]
         made += 1
         if first is None:
             first, first_slot, first_max = action, slot, action_max

@@ -143,13 +143,27 @@ class IMPORT_SCENE_OT_wow_m2(Operator, ImportHelper):
         description="Negate the X axis (flip handedness) if your pipeline expects it",
         default=False,
     )
+    repair_weights: BoolProperty(
+        name="Repair Stray Weights",
+        description="A vertex bound to a bone that none of its neighbours use (retail "
+                    "files have the odd one bound to the root in the middle of a head "
+                    "part) takes its neighbours' weights, so it moves with the rest",
+        default=True,
+    )
+    normalize_uvs: BoolProperty(
+        name="Normalize UV Tiles",
+        description="Shift each UV island by whole tiles onto the 0-1 grid. Retail hair "
+                    "sits several tiles away from the origin; with its wrapping texture "
+                    "that draws the same in game but is awkward to edit. Only axes the "
+                    "texture wraps on are shifted, so the model looks identical",
+        default=True,
+    )
     import_phys: BoolProperty(
         name="Import Physics (.phys)",
-        description="If a sibling '<name>.phys' file exists next to the .m2, "
-                    "read it and rebuild the rigid-body world in Blender: one "
-                    "primitive per Body (parented to its bone) plus a "
-                    "constraint empty per Joint. Edit and re-export to write "
-                    "the .phys back out",
+        description="Build an editable physics rig from the model's physics "
+                    "data: the PFDC chunk embedded in the .m2 (modern retail "
+                    "models), or a '<name>.phys' file next to it. Edit it in the "
+                    "M2 Physics panel and preview it before exporting",
         default=True,
     )
     phys_override_path: StringProperty(
@@ -182,6 +196,8 @@ class IMPORT_SCENE_OT_wow_m2(Operator, ImportHelper):
         sub.prop(self, "max_animations")
 
         layout.prop(self, "mirror_x")
+        layout.prop(self, "normalize_uvs")
+        layout.prop(self, "repair_weights")
         layout.prop(self, "import_phys")
         if self.import_phys:
             layout.prop(self, "phys_override_path")
@@ -219,6 +235,8 @@ class IMPORT_SCENE_OT_wow_m2(Operator, ImportHelper):
                     weld_seams=self.weld_seams,
                     import_bounds=self.import_bounds,
                     import_events=self.import_events,
+                    normalize_uvs=self.normalize_uvs,
+                    repair_weights=self.repair_weights,
                 )
                 # Remember where this came from so export can re-read the M2
                 context.scene["m2_source_m2"] = path
@@ -236,6 +254,7 @@ class IMPORT_SCENE_OT_wow_m2(Operator, ImportHelper):
                             context, path, arm_obj, model_name,
                             mirror_x=self.mirror_x,
                             explicit_path=explicit,
+                            pfdc=(model.aux_chunks or {}).get("PFDC", b""),
                         )
                     except Exception as exc:  # noqa: BLE001
                         traceback.print_exc()
@@ -299,47 +318,63 @@ def _apply_geoset_visibility(model, force_zero, op):
         op.report({"WARNING"}, msg)
 
 
-def _build_phys_bytes(context, objects, mirror_x, op, model, phys_file_id):
-    """Build .phys bytes if the scene has a Rigid Body World, otherwise None.
+def _build_phys_bytes(context, objects, mirror_x, op, model):
+    """.phys bytes for the scene's physics rig, or None when there isn't one.
 
-    Side effects on `model`:
-      - If phys_file_id > 0: add a PFID aux chunk pointing at it.
-      - Else: OR GlobalModelFlags 0x20 so the client name-siblings .phys.
+    Marks ``model`` so the client loads it: GlobalModelFlags 0x20 and the data
+    itself in a PFDC chunk, the way retail models carry physics. Nothing extra
+    has to be registered.
     """
-    try:
-        from .m2_import import phys_from_scene
-    except Exception as exc:  # noqa: BLE001
-        print("[phys] module import failed: %s" % exc, flush=True)
-        return None
-
+    from .m2_import import phys, phys_from_scene, m2_physics_ui
     arm = next((o for o in objects if o.type == "ARMATURE"), None)
     try:
-        doc = phys_from_scene.build_phys_doc(context, arm, mirror_x=mirror_x)
+        with m2_physics_ui.at_rest(context):
+            doc = phys_from_scene.build_phys_doc(context, arm, mirror_x=mirror_x)
+        data = None if doc is None else phys.write(doc)
+    except phys_from_scene.RigError as exc:
+        op.report({"WARNING"}, "Physics NOT exported: %s" % exc)
+        return None
     except Exception as exc:  # noqa: BLE001
-        import traceback; traceback.print_exc()
-        op.report({"WARNING"}, "phys build failed: %s" % exc)
+        traceback.print_exc()
+        op.report({"WARNING"}, "Physics export failed: %s" % exc)
         return None
-    if doc is None:
+    if data is None:
+        if model.aux_chunks:
+            model.aux_chunks.pop("PFDC", None)     # rig was removed: drop stale data
         return None
-
-    from .m2_import import phys as phys_mod
-    data = phys_mod.write(doc)
 
     import struct
-    if phys_file_id and phys_file_id > 0:
-        if model.aux_chunks is None:
-            model.aux_chunks = {}
-        model.aux_chunks["PFID"] = struct.pack("<I", int(phys_file_id) & 0xFFFFFFFF)
-        print("[phys] wrote PFID=%d chunk (%d bodies, %d shapes, %d joints, %d bytes)"
-              % (phys_file_id, len(doc.bodies), len(doc.shapes),
-                 len(doc.joints), len(data)), flush=True)
-    else:
-        model.global_flags = (int(getattr(model, "global_flags", 0)) | 0x20) & 0xFFFFFFFF
-        print("[phys] set GlobalModelFlags 0x20 (sibling .phys) "
-              "(%d bodies, %d shapes, %d joints, %d bytes)"
-              % (len(doc.bodies), len(doc.shapes), len(doc.joints), len(data)),
-              flush=True)
+    if model.aux_chunks is None:
+        model.aux_chunks = {}
+    model.global_flags = (int(getattr(model, "global_flags", 0)) | 0x20) & 0xFFFFFFFF
+    # The client only lets physics move a bone that carries flag 0x400
+    # ("kinematic bone"). Retail sets it on every simulated bone; a character
+    # bone you rig in Blender will not have it, so set it here.
+    # Retail physics bones carry 0x400 and never 0x200 ("transformed" by
+    # animation); a character bone keeps its keyframes otherwise.
+    flagged = 0
+    for body in doc.bodies:
+        if body.type == phys.BODY_DYNAMIC and body.bone_index < len(model.bones):
+            bone = model.bones[body.bone_index]
+            new = (bone.flags | 0x400) & ~0x200
+            if new != bone.flags:
+                bone.flags = new
+                flagged += 1
+    if flagged:
+        print("[phys] set bone flag 0x400 / cleared 0x200 on %d physics bone(s)" % flagged, flush=True)
+    model.aux_chunks.pop("PFID", None)          # a stale id would send the client elsewhere
+    model.aux_chunks["PFDC"] = data + bytes(-len(data) % 4)
+    print("[phys] exported %d bytes (embedded as PFDC)" % len(data), flush=True)
+    bones = sorted({b.bone_index for b in doc.bodies if b.type == phys.BODY_DYNAMIC})
+    op.report({"INFO"}, "Physics embedded: %d bodies, %d joints; bone flag 0x400 on bones %s"
+              % (len(doc.bodies), len(doc.joints), ", ".join(str(b) for b in bones) or "(none)"))
     return data
+
+
+def _model_objects(objects):
+    """Scene objects minus the physics rig, which must not become geometry."""
+    from .m2_import import phys_rig
+    return [o for o in objects if not phys_rig.is_rig_object(o)]
 
 
 class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
@@ -453,15 +488,6 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
         description="Negate the X axis on the way out (match the import setting you used)",
         default=False,
     )
-    phys_file_id: bpy.props.IntProperty(
-        name="Phys FileDataID",
-        description="If the scene has a Rigid Body World, also write a sibling "
-                    ".phys file. When this is non-zero, add a PFID chunk to the "
-                    "M2 pointing at it. When zero, set the M2's GlobalModelFlags "
-                    "0x20 bit so the client loads the .phys as a name-siblinged "
-                    "asset instead",
-        default=0, min=0,
-    )
     selected_only: BoolProperty(
         name="Selected Only",
         description="Export from the selected objects only, instead of the whole scene",
@@ -482,7 +508,7 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
                 layout.prop(self, "export_scale")
                 layout.prop(self, "selected_only")
                 layout.prop(self, "mirror_x")
-                layout.prop(self, "phys_file_id")
+                self._draw_phys(context, layout)
                 return
             layout.prop(self, "full_custom")
             if self.full_custom:
@@ -499,6 +525,15 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
         layout.prop(self, "export_scale")
         layout.prop(self, "selected_only")
         layout.prop(self, "mirror_x")
+        if self.container == "CHUNKED" and not self.base_m2_path:
+            self._draw_phys(context, layout)
+
+    def _draw_phys(self, context, layout):
+        from .m2_import import phys_rig
+        if not phys_rig.rig_collections():
+            return
+        layout.label(text="Physics rig found: it will be embedded in the M2.",
+                     icon="RIGID_BODY")
 
     def _source_m2(self, context, tried=None):
         """Path to the .m2 this scene came from, or "" if we can't find one."""
@@ -523,8 +558,8 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
 
     def execute(self, context):
         from .m2_import import scene_reader, writer
-        objects = (context.selected_objects if self.selected_only
-                   else list(context.scene.objects))
+        objects = _model_objects(context.selected_objects if self.selected_only
+                                 else list(context.scene.objects))
         chunked = self.container == "CHUNKED"
         try:
             print("[M2] exporting %s (%s)" % (self.filepath, self.container), flush=True)
@@ -551,10 +586,7 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
                 writer.scale_model(model, self.export_scale)
                 _apply_geoset_visibility(model, self.all_geosets_visible, self)
 
-                phys_bytes = _build_phys_bytes(
-                    context, objects, self.mirror_x, self, model,
-                    self.phys_file_id,
-                )
+                phys_bytes = _build_phys_bytes(context, objects, self.mirror_x, self, model)
 
                 skin_ids = [self.skin_file_id] if self.skin_file_id else None
                 # One TXID entry per texture the materials resolved to, not just
@@ -628,6 +660,7 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
                             t.file_data_id = self.body_texture_id
                             t.filename = ""
                 tex_fids = [t.file_data_id for t in model.textures]
+                phys_bytes = _build_phys_bytes(context, objects, self.mirror_x, self, model)
                 skel_bytes = writer.write_skel(model)
                 m2_bytes, skin_bytes = writer.write_custom_character(
                     model, self.skel_file_id, [self.skin_file_id],
@@ -640,6 +673,9 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
                 if skin_bytes is not None:
                     with open(bbase + "00.skin", "wb") as f:
                         f.write(skin_bytes)
+                if phys_bytes is not None:
+                    with open(bbase + ".phys", "wb") as f:
+                        f.write(phys_bytes)
                 tx = ", ".join(str(t.file_data_id) for t in model.textures if t.file_data_id)
                 print("[M2] standalone custom: .m2 + .skel + 00.skin (single-LOD) | "
                       "SKID=%d SFID=%d TXID=[%s]" % (self.skel_file_id, self.skin_file_id, tx),
@@ -698,6 +734,13 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
                           % (os.path.basename(base), lod_count), flush=True)
                     patched = True
             if not patched:
+                if chunked:
+                    phys_bytes = _build_phys_bytes(context, objects, self.mirror_x, self, model)
+                    if phys_bytes is not None:
+                        pb = (self.filepath[:-3] if self.filepath.lower().endswith(".m2")
+                              else self.filepath)
+                        with open(pb + ".phys", "wb") as f:
+                            f.write(phys_bytes)
                 writer.write_model(
                     model, self.filepath, chunked=chunked,
                     version=self.m2_version if chunked else 264,
@@ -728,6 +771,13 @@ class EXPORT_SCENE_OT_wow_m2(Operator, ExportHelper):
             f"Exported {os.path.basename(self.filepath)} [{self.container}]: "
             f"{len(model.vertices)} verts, {tris} tris, {len(model.bones)} bones, "
             f"{len(model.sequences)} anims (+ {lod_count} skin LOD{'s' if lod_count>1 else ''}){extra}")
+        if patched:
+            from .m2_import import phys_rig
+            if phys_rig.rig_collections():
+                self.report({"WARNING"},
+                            "Patch mode keeps the target's own physics: the rig in this "
+                            "scene was NOT written. Export with New Model or Full Custom "
+                            "to include it.")
         return {"FINISHED"}
 
 

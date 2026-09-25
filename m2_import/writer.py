@@ -181,8 +181,11 @@ def link_animation_variations(model):
 
 
 def _pack_sequence(s, bounds):
+    """``bounds`` is the fallback for a sequence without its own box: the
+    rest-pose mesh extents, never the render bounds (which cover every
+    animation and would push the character-screen camera far away)."""
     flags = (s.flags | 0x20) & 0xFFFFFFFF
-    (bx0, by0, bz0), (bx1, by1, bz1), radius = bounds
+    (bx0, by0, bz0), (bx1, by1, bz1), radius = getattr(s, "bounds", None) or bounds
     freq = int(getattr(s, "frequency", 0)) & 0xFFFF
     vnext = int(getattr(s, "variation_next", -1))
     anext = int(getattr(s, "alias_next", 0)) & 0xFFFF
@@ -434,22 +437,66 @@ def scale_model(model, k):
         c.far_clip *= k
         scale_track(c.position)
         scale_track(c.target)
-    ov = getattr(model, "bounding_override", None)
-    if ov:
-        model.bounding_override = (s3(ov[0]), s3(ov[1]))
+    for s in model.sequences:
+        if getattr(s, "bounds", None):
+            s.bounds = (s3(s.bounds[0]), s3(s.bounds[1]), float(s.bounds[2]) * k)
+    for attr in ("bounding_override", "collision_override"):
+        ov = getattr(model, attr, None)
+        if ov:
+            setattr(model, attr, (s3(ov[0]), s3(ov[1])))
+    for lo, hi, rad in (("bounding_min", "bounding_max", "bounding_radius"),
+                        ("collision_min", "collision_max", "collision_radius")):
+        if getattr(model, lo, None) is not None:
+            setattr(model, lo, s3(getattr(model, lo)))
+            setattr(model, hi, s3(getattr(model, hi)))
+            setattr(model, rad, float(getattr(model, rad) or 0.0) * k)
     print("[M2] scaled model by %.4f" % k, flush=True)
 
 
+def _box_close(a, b, eps=1e-4):
+    return a is not None and b is not None and all(abs(x - y) <= eps for x, y in zip(a, b))
+
+
+def _half_diagonal(mn, mx):
+    return (((mx[0] - mn[0]) ** 2 + (mx[1] - mn[1]) ** 2 + (mx[2] - mn[2]) ** 2) ** 0.5) / 2.0
+
+
 def _model_bounds(model):
-    """Bounds to write: an explicit override (edited box) wins, else vertices."""
+    """Render bounds to write: the edited box if the scene has one, else the
+    source model's, else the vertices. The stored sphere radius is kept while
+    the box is unchanged (retail's radius is not derived from the box)."""
     ov = getattr(model, "bounding_override", None)
     if ov:
         mn, mx = ov
-        cx, cy, cz = ((mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2)
-        radius = (((mx[0] - cx) ** 2 + (mx[1] - cy) ** 2
-                   + (mx[2] - cz) ** 2) ** 0.5)
-        return tuple(mn), tuple(mx), radius
+        if _box_close(mn, model.bounding_min) and _box_close(mx, model.bounding_max) \
+                and model.bounding_radius:
+            return tuple(mn), tuple(mx), float(model.bounding_radius)
+        return tuple(mn), tuple(mx), _half_diagonal(mn, mx)
+    if model.bounding_min is not None and model.bounding_max is not None:
+        return (tuple(model.bounding_min), tuple(model.bounding_max),
+                float(model.bounding_radius) or _half_diagonal(model.bounding_min, model.bounding_max))
     return _bounds(model.vertices)
+
+
+def _collision_bounds(model, render_bounds):
+    """Collision box to write. Retail characters keep a body-sized box here
+    (the character and transmog screens frame the camera from it), so it is
+    never the render box unless nothing better is known."""
+    ov = getattr(model, "collision_override", None)
+    if ov:
+        mn, mx = ov
+        if _box_close(mn, model.collision_min) and _box_close(mx, model.collision_max) \
+                and model.collision_radius:
+            return tuple(mn), tuple(mx), float(model.collision_radius)
+        return tuple(mn), tuple(mx), _half_diagonal(mn, mx)
+    if model.collision_min is not None and model.collision_max is not None \
+            and any(model.collision_max[i] - model.collision_min[i] > 1e-6 for i in range(3)):
+        return (tuple(model.collision_min), tuple(model.collision_max),
+                float(model.collision_radius) or _half_diagonal(model.collision_min, model.collision_max))
+    if model.vertices:
+        mn, mx, _ = _bounds(model.vertices)
+        return mn, mx, _half_diagonal(mn, mx)
+    return render_bounds
 
 
 def _bounds(vertices):
@@ -476,12 +523,13 @@ def write_m2(model, version=264, track_nseq=None):
     nseq = len(seqs)
     rnseq = track_nseq if track_nseq is not None else nseq
     bounds = _model_bounds(model)
+    seq_bounds = _bounds(model.vertices) if model.vertices else bounds
 
     name = (model.name or "").encode("utf-8") + b"\x00"
     name_off = buf.append(name)
     gl = model.global_loops
     gl_off = buf.append(struct.pack("<%dI" % len(gl), *gl)) if gl else 0
-    seq_off = buf.append(b"".join(_pack_sequence(s, bounds) for s in seqs)) if seqs else 0
+    seq_off = buf.append(b"".join(_pack_sequence(s, seq_bounds) for s in seqs)) if seqs else 0
     sl = model.seq_lookup
     sl_off = buf.append(struct.pack("<%dH" % len(sl), *(v & 0xFFFF for v in sl))) \
         if sl else 0
@@ -504,8 +552,10 @@ def write_m2(model, version=264, track_nseq=None):
 
     tex_structs = bytearray()
     for t in model.textures:
-        fn = (t.filename or "").encode("utf-8") + b"\x00"
-        f_off = buf.append(fn)
+        # Retail writes an empty name as length 0 (the FileDataID comes from
+        # TXID); only a real path gets a NUL-terminated string.
+        fn = ((t.filename or "").encode("utf-8") + b"\x00") if t.filename else b""
+        f_off = buf.append(fn) if fn else 0
         tex_structs += struct.pack("<IIII", t.type & 0xFFFFFFFF,
                                    t.flags & 0xFFFFFFFF, len(fn), f_off)
     tex_off = buf.append(bytes(tex_structs)) if model.textures else 0
@@ -578,8 +628,9 @@ def write_m2(model, version=264, track_nseq=None):
     h += struct.pack("<II", len(tc), tc_off)            # textureTransformCombos
     h += struct.pack("<6f", *bbmin, *bbmax)
     h += struct.pack("<f", radius)
-    h += struct.pack("<6f", *bbmin, *bbmax)
-    h += struct.pack("<f", radius)
+    cmin, cmax, cradius = _collision_bounds(model, bounds)
+    h += struct.pack("<6f", *cmin, *cmax)               # collision_box
+    h += struct.pack("<f", cradius)                     # collision_sphere_radius
     h += struct.pack("<II", 0, 0)                       # collisionIndices
     h += struct.pack("<II", 0, 0)                       # collisionPositions
     h += struct.pack("<II", 0, 0)                       # collisionFaceNormals
@@ -896,6 +947,11 @@ def write_custom_character(model, skel_file_id, skin_file_ids,
                                            *(int(x) & 0xFFFFFFFF for x in texture_file_ids)))
     if skel_file_id:
         out += _chunk(b"SKID", struct.pack("<I", int(skel_file_id) & 0xFFFFFFFF))
+    # Physics: the rig embedded as PFDC, and/or a PFID to a separate .phys.
+    for name in ("PFDC", "PFID"):
+        raw = (model.aux_chunks or {}).get(name)
+        if raw:
+            out += _chunk(name.encode("ascii"), raw)
     skin_bytes = write_skin(model.skin, modern=True) if model.skin else None
     return bytes(out), skin_bytes
 
@@ -934,6 +990,7 @@ def write_skel(model):
     ensure_events(model)
     nseq = len(model.sequences)
     bounds = _model_bounds(model) if (model.vertices or getattr(model, "bounding_override", None)) else ((0, 0, 0), (0, 0, 0), 0.0)
+    seq_bounds = _bounds(model.vertices) if model.vertices else bounds
 
     def b_skl1(buf):
         nm = (model.name or "").encode("utf-8") + b"\x00"
@@ -943,7 +1000,7 @@ def write_skel(model):
     def b_sks1(buf):
         gl = model.global_loops
         gl_off = buf.append(struct.pack("<%dI" % len(gl), *gl)) if gl else 0
-        seq_off = buf.append(b"".join(_pack_sequence(s, bounds) for s in model.sequences)) \
+        seq_off = buf.append(b"".join(_pack_sequence(s, seq_bounds) for s in model.sequences)) \
             if model.sequences else 0
         sl = model.seq_lookup
         sl_off = buf.append(struct.pack("<%dH" % len(sl), *(v & 0xFFFF for v in sl))) if sl else 0

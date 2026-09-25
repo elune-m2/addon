@@ -93,6 +93,13 @@ def parse_skin(reader: BinaryReader, has_sort: bool, modern_batch: bool) -> M2Sk
     profile = M2SkinProfile()
     profile.vertices = a_vertices.read_u16(reader)
     profile.triangles = a_indices.read_u16(reader)
+    # Per skin vertex: 4 bone indices into the submesh's palette slice of
+    # boneCombos. This is what the client skins with (the M2 vertex table's
+    # own bone indices can disagree with it), so import must resolve it.
+    if a_bones.count == len(profile.vertices) and a_bones.base_offset(reader) + a_bones.count * 4 <= n:
+        base = a_bones.base_offset(reader)
+        d = reader.data
+        profile.bone_indices = [tuple(d[base + 4 * i:base + 4 * i + 4]) for i in range(a_bones.count)]
     profile.submeshes = a_submeshes.read(reader, lambda r: _read_skin_section(r, has_sort))
     batch_reader = _read_batch_modern if modern_batch else _read_batch_old
     profile.batches = a_batches.read(reader, batch_reader)

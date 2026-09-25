@@ -105,6 +105,29 @@ def _stamp_material(mat, model, batch):
             pass
     mat["m2_shader_id"] = int(batch.shader_id)
     mat["m2_material_layer"] = int(batch.material_layer)
+    # Batch-level render data with no Blender equivalent, kept so export can
+    # reproduce it: batch flags (retail: 0x10 on body batches, 0x80 on eye
+    # glow), the colour-track index, and per layer the UV set, the texture
+    # transform (the UV scroll that makes eye glow pulse) and the weight track.
+    mat["m2_batch_flags"] = int(batch.flags)
+    mat["m2_color_index"] = int(batch.color_index)
+    coords, transforms, weights = [], [], []
+    for k in range(max(1, batch.texture_count)):
+        ci = batch.texture_coord_combo + k
+        # No coord-combo entry (retail characters leave the array empty) means
+        # layer k samples UV set k.
+        coords.append(int(model.tex_coord_combos[ci]) if 0 <= ci < len(model.tex_coord_combos) else k)
+        ti = batch.texture_transform_combo + k
+        transforms.append(int(model.tex_transform_combos[ti])
+                          if 0 <= ti < len(model.tex_transform_combos) else 0xFFFF)
+        wi = batch.texture_weight_combo + k
+        weights.append(int(model.tex_weight_combos[wi]) if 0 <= wi < len(model.tex_weight_combos) else 0)
+    mat["m2_texture_coords"] = ",".join(str(c) for c in coords)
+    # M2Texture.flags per layer: 0x1 wrap U, 0x2 wrap V. A scrolling glow layer
+    # needs wrap or the scroll clamps at the texture edge.
+    mat["m2_texture_flags"] = ",".join(str(int(t.flags)) for t in texes)
+    mat["m2_texture_transforms"] = ",".join(str(t) for t in transforms)
+    mat["m2_texture_weights"] = ",".join(str(w) for w in weights)
     try:
         from . import m2_ui
         m2_ui.sync_props_from_customprops(mat)
@@ -112,8 +135,70 @@ def _stamp_material(mat, model, batch):
         _log("warning: could not sync panel props on %s: %r" % (mat.name, exc))
 
 
+def _normalize_uv_tiles(uv_flat, faces, face_slot, slot_textures):
+    """Shift every UV island by whole tiles onto the 0..1 grid.
+
+    Retail meshes (hair especially) lay their UV islands several tiles away
+    from the origin; with a wrapping texture that draws identically, but it is
+    a mess to edit. A whole-tile shift changes nothing the client draws, so it
+    is only done on axes where the island's texture wraps (M2Texture flags
+    0x1 / 0x2). Islands are UV islands: faces joined only where they share an
+    edge with the same UVs on both sides, since one hair mesh holds many
+    separate strands in UV space.
+    """
+    import math
+    nf = len(faces)
+    parent = list(range(nf))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def key(v, li):
+        return (v, round(uv_flat[2 * li], 4), round(uv_flat[2 * li + 1], 4))
+
+    edge_owner = {}
+    for fi, f in enumerate(faces):
+        for c in range(3):
+            a, b = key(f[c], 3 * fi + c), key(f[(c + 1) % 3], 3 * fi + (c + 1) % 3)
+            ek = (a, b) if a <= b else (b, a)
+            other = edge_owner.setdefault(ek, fi)
+            if other != fi:
+                ra, rb = find(other), find(fi)
+                if ra != rb:
+                    parent[rb] = ra
+    sums = {}
+    for fi in range(nf):
+        acc = sums.setdefault(find(fi), [0.0, 0.0, 0, face_slot[fi]])
+        for c in range(3):
+            acc[0] += uv_flat[2 * (3 * fi + c)]
+            acc[1] += uv_flat[2 * (3 * fi + c) + 1]
+            acc[2] += 1
+    shifts = {}
+    for isl, (su, sv, n, slot) in sums.items():
+        texes = slot_textures[slot] if 0 <= slot < len(slot_textures) else []
+        flags = texes[0].flags if texes else 0x3
+        du = math.floor(su / n) if flags & 0x1 else 0
+        dv = math.floor(sv / n) if flags & 0x2 else 0
+        if du or dv:
+            shifts[isl] = (du, dv)
+    moved = 0
+    for fi in range(nf):
+        sh = shifts.get(find(fi))
+        if sh is None:
+            continue
+        moved += 1
+        for c in range(3):
+            uv_flat[2 * (3 * fi + c)] -= sh[0]
+            uv_flat[2 * (3 * fi + c) + 1] -= sh[1]
+    return moved
+
+
 def _make_mesh_object(model, subs, name, mirror_x, batch_for_submesh,
-                      arm_obj, collection, weld_seams=True):
+                      arm_obj, collection, weld_seams=True, normalize_uvs=True,
+                      repair_weights=True):
     """Build one mesh object from a list of (submesh_index, submesh) pairs."""
     skin = model.skin
     tri = skin.triangles
@@ -219,8 +304,23 @@ def _make_mesh_object(model, subs, name, mirror_x, batch_for_submesh,
         u, v = mverts[g].uv1
         uv_flat[2 * i] = u
         uv_flat[2 * i + 1] = 1.0 - v
+    if normalize_uvs:
+        _normalize_uv_tiles(uv_flat, faces, face_slot,
+                            [_batch_textures(model, b) for _, b in materials])
     uv_layer = mesh.uv_layers.new(name="UVMap")
     uv_layer.data.foreach_set("uv", uv_flat)
+    # Second UV set. Multi-layer materials (eye glow, eyeballs, tabards) sample
+    # it with their second texture layer; single-layer geosets store zeros and
+    # get no second map.
+    if any(mverts[g].uv2 != (0.0, 0.0) for g in corner_globals):
+        uv2_flat = [0.0] * (2 * n_loops)
+        for i, g in enumerate(corner_globals):
+            u, v = mverts[g].uv2
+            uv2_flat[2 * i] = u
+            uv2_flat[2 * i + 1] = 1.0 - v
+        uv2_layer = mesh.uv_layers.new(name="UVMap2")
+        uv2_layer.data.foreach_set("uv", uv2_flat)
+        mesh.uv_layers.active_index = 0
 
     # Tag each vertex with a representative M2 global index. Export's in-place
     try:
@@ -249,18 +349,70 @@ def _make_mesh_object(model, subs, name, mirror_x, batch_for_submesh,
     collection.objects.link(obj)
 
     if arm_obj is not None:
-        _apply_skinning(model, obj, arm_obj, local_to_global)
+        _apply_skinning(model, obj, arm_obj, local_to_global, faces=faces,
+                        repair=repair_weights)
 
     return obj
 
 
-def _apply_skinning(model, mesh_obj, arm_obj, local_to_global):
+def _repair_stray_weights(model, local_to_global, faces, log):
+    """Weights for vertices bound to bones none of their neighbours use.
+
+    Retail meshes occasionally leave a single vertex bound to the root bone in
+    the middle of a part that is otherwise all one bone (a blood elf eye glow
+    has one); it stays behind when the head moves. Such a vertex takes the
+    averaged weights of the vertices it shares faces with. Returns
+    {local vertex: [(bone, weight 0..255), ...]} for the repaired vertices.
+    """
+    verts = model.vertices
+
+    def bones_of(g):
+        v = verts[g]
+        return {bi for bi, bw in zip(v.bone_indices, v.bone_weights) if bw}
+
+    neighbours = {}
+    for f in faces:
+        for a in f:
+            for b in f:
+                if a != b:
+                    neighbours.setdefault(a, set()).add(b)
+    fixed = {}
+    for local_idx, nbrs in neighbours.items():
+        mine = bones_of(local_to_global[local_idx])
+        if not mine:
+            continue
+        theirs = set()
+        for nb in nbrs:
+            theirs |= bones_of(local_to_global[nb])
+        if not theirs or mine & theirs:
+            continue
+        acc = {}
+        for nb in nbrs:
+            v = verts[local_to_global[nb]]
+            for bi, bw in zip(v.bone_indices, v.bone_weights):
+                if bw:
+                    acc[bi] = acc.get(bi, 0.0) + bw / len(nbrs)
+        if acc:
+            fixed[local_idx] = sorted(acc.items(), key=lambda kv: -kv[1])[:4]
+    if fixed:
+        log("repaired %d stray-weighted vertex(es) bound to a bone none of their "
+            "neighbours use (e.g. root); they now follow their neighbours" % len(fixed))
+    return fixed
+
+
+def _apply_skinning(model, mesh_obj, arm_obj, local_to_global, faces=None, repair=True):
     """Create per-bone vertex groups for this object's vertices and bind it."""
     n_bones = len(model.bones)
     verts = model.vertices
+    fixed = _repair_stray_weights(model, local_to_global, faces, _log) if (repair and faces) else {}
     # buckets[bone_index][raw_weight] -> list of local vertex indices
     buckets = {}
     for local_idx, global_idx in enumerate(local_to_global):
+        if local_idx in fixed:
+            for bi, bw in fixed[local_idx]:
+                if 0 <= bi < n_bones and bw > 0:
+                    buckets.setdefault(bi, {}).setdefault(bw / 255.0 * 255.0, []).append(local_idx)
+            continue
         v = verts[global_idx]
         for bi, bw in zip(v.bone_indices, v.bone_weights):
             if bw == 0 or not (0 <= bi < n_bones):
@@ -325,9 +477,17 @@ def _build_armature(model, name, mirror_x, collection, bone_tilt=0.0):
     return arm_obj
 
 
-def _build_bounds_box(model, name, mirror_x, collection):
-    """Create an editable wireframe box showing the model's render bounding box."""
-    mn, mx = model.bounding_min, model.bounding_max
+def _build_bounds_box(model, name, mirror_x, collection, kind="bounding"):
+    """An editable wireframe box: the render bounds ("bounding") or the
+    collision box ("collision"). The client frames the character and transmog
+    screens from the collision box, so that is the one to move or resize to
+    change where those cameras look."""
+    if kind == "collision":
+        mn, mx = model.collision_min, model.collision_max
+        if mn is None or mx is None or all(mx[i] - mn[i] <= 1e-6 for i in range(3)):
+            return None
+    else:
+        mn, mx = model.bounding_min, model.bounding_max
     if mn is None or mx is None:
         if not model.vertices:
             return None
@@ -346,11 +506,12 @@ def _build_bounds_box(model, name, mirror_x, collection):
              (hi[0], hi[1], hi[2]), (lo[0], hi[1], hi[2])]
     edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
              (0, 4), (1, 5), (2, 6), (3, 7)]
-    me = bpy.data.meshes.new(name + "_BoundingBox")
+    label = "M2_CollisionBox" if kind == "collision" else "M2_BoundingBox"
+    me = bpy.data.meshes.new(name + "_" + label[3:])
     me.from_pydata(verts, edges, [])
     me.update()
-    obj = bpy.data.objects.new("M2_BoundingBox", me)
-    obj["m2_bounding_box"] = 1
+    obj = bpy.data.objects.new(label, me)
+    obj["m2_collision_box" if kind == "collision" else "m2_bounding_box"] = 1
     obj.display_type = "WIRE"
     obj.hide_render = True
     obj.show_in_front = True
@@ -362,6 +523,7 @@ def build(model, *, import_armature=True, mirror_x=False,
           split_geosets=True, import_animations=True,
           import_attachments=True, import_cameras=True, fps=30, max_animations=0,
           collection=None, bone_tilt=0.0, weld_seams=True, import_bounds=True,
+          normalize_uvs=True, repair_weights=True,
           import_events=True):
     """Create Blender objects from ``model``."""
     if collection is None:
@@ -416,7 +578,7 @@ def build(model, *, import_armature=True, mirror_x=False,
             obj_name = "%s_geoset_%04d" % (name, sub.skin_section_id)
             obj = _make_mesh_object(
                 model, [(si, sub)], obj_name, mirror_x,
-                batch_for_submesh, arm_obj, collection, weld_seams=weld_seams)
+                batch_for_submesh, arm_obj, collection, weld_seams=weld_seams, normalize_uvs=normalize_uvs, repair_weights=repair_weights)
             if obj is not None:
                 obj["m2_order"] = si                      # submesh index in skin
                 obj["m2_skin_section_id"] = sub.skin_section_id
@@ -432,7 +594,7 @@ def build(model, *, import_armature=True, mirror_x=False,
         _log("building merged mesh")
         obj = _make_mesh_object(
             model, list(enumerate(skin.submeshes)), name, mirror_x,
-            batch_for_submesh, arm_obj, collection, weld_seams=weld_seams)
+            batch_for_submesh, arm_obj, collection, weld_seams=weld_seams, normalize_uvs=normalize_uvs, repair_weights=repair_weights)
         if obj is not None:
             created.append(obj)
         _progress(60)
@@ -463,7 +625,9 @@ def build(model, *, import_armature=True, mirror_x=False,
                                         collection, _log)
     if import_bounds:
         if _build_bounds_box(model, name, mirror_x, collection) is not None:
-            _log("created editable bounding box 'M2_BoundingBox'")
+            _log("created editable render bounds 'M2_BoundingBox'")
+        if _build_bounds_box(model, name, mirror_x, collection, kind="collision") is not None:
+            _log("created editable collision box 'M2_CollisionBox' (character-screen framing)")
     _progress(70)
 
     if import_animations:
