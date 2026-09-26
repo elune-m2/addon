@@ -865,9 +865,199 @@ class M2_OT_sync_geoset_id_from_group_var(Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Retarget M2I: move another rig's meshes onto the imported M2 skeleton.
+def _poll_armature(self, obj):
+    return obj is not None and obj.type == "ARMATURE"
+
+
+class M2RetargetProps(PropertyGroup):
+    m2_rig: PointerProperty(
+        type=bpy.types.Object, poll=_poll_armature, name="M2 Rig",
+        description="The imported M2 armature: its bone names, geoset "
+                    "settings and materials are the reference")
+    other_rig: PointerProperty(
+        type=bpy.types.Object, poll=_poll_armature, name="M2I Rig",
+        description="The M2I armature whose bones get renamed (paired with the M2 "
+                    "bones by order) and whose meshes move onto the M2 rig")
+    bone_distance: FloatProperty(
+        name="Bone Tolerance", default=0.05, min=0.0, soft_max=1.0, precision=3,
+        description="Largest head distance (model units) still accepted as the same bone "
+                    "when a bone has to be found by position (rigs with different bone "
+                    "counts, or vertex groups fixed by bone position)")
+    mesh_method: EnumProperty(
+        name="Match Meshes",
+        items=[("AUTO", "By name, then shape", "A mesh named like a geoset (suffixes such as .001 ignored) "
+                "takes that geoset; the rest are paired by shape"),
+               ("NAME", "By name", "Only meshes named like a geoset are paired"),
+               ("SHAPE", "By shape", "Pair by geometry: same vertices in the same place"),
+               ("ORDER", "By order", "Pair index by index: meshes in name order against geosets in "
+                "their M2 order. Use when names and shapes both changed")],
+        default="AUTO")
+    shape_distance: FloatProperty(
+        name="Shape Tolerance", default=0.01, min=0.0, soft_max=1.0, precision=4,
+        description="Largest mean vertex distance (model units) for two meshes "
+                    "to count as the same geoset shape")
+    take_names: BoolProperty(
+        name="Take Over Names", default=True,
+        description="Rename each converted mesh to the geoset it replaces "
+                    "(the original gets a .replaced suffix)")
+    originals: EnumProperty(
+        name="Replaced Geosets",
+        items=[("DELETE", "Delete", "Remove the original geoset meshes the converted ones replace"),
+               ("HIDE", "Hide", "Keep them hidden (note: hidden meshes still export unless "
+                "you export with Selected Only)"),
+               ("KEEP", "Keep", "Leave them as they are")],
+        default="DELETE")
+    remove_other: BoolProperty(
+        name="Remove M2I Rig", default=True,
+        description="Delete the M2I armature once it has no children left, "
+                    "so the exporter sees one skeleton")
+    guess_from_weights: BoolProperty(
+        name="Guess Lost Groups From Weights", default=True,
+        description="A vertex group whose bone exists on no armature any more is "
+                    "put on the M2 bone closest to the group's weighted centre")
+    copy_uvs: BoolProperty(
+        name="Copy Missing UV Sets", default=True,
+        description="UV sets the replaced geoset has and the new mesh lacks (UVMap2 for "
+                    "eye-glow layers) are transferred by position")
+    repair_weights: BoolProperty(
+        name="Repair Stray Weights", default=True,
+        description="A vertex sharing no bone with its neighbours, or with no weight at all, "
+                    "takes its neighbours' weights")
+
+
+class M2_OT_retarget_fix_groups(Operator):
+    """Re-point every vertex group that names no M2 bone: by the rest position of the bone it was made for (looked up on any other armature in the file), else by the group's weighted centre. Works on the selected meshes, or on all meshes of the M2 rig when none are selected"""
+    bl_idname = "m2.retarget_fix_groups"
+    bl_label = "Fix Vertex Groups by Bone Position"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import retarget as _rt
+        p = context.scene.m2_retarget
+        if p.m2_rig is None:
+            self.report({"ERROR"}, "Pick the M2 rig first.")
+            return {"CANCELLED"}
+        meshes = [o for o in context.selected_objects if o.type == "MESH"]
+        if not meshes:
+            meshes = [o for o in p.m2_rig.children_recursive if o.type == "MESH"]
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        r = _rt.fix_groups(meshes, p.m2_rig, p.bone_distance, p.guess_from_weights,
+                           log=lambda s: print(s, flush=True))
+        msg = "%d vertex group(s) re-pointed on %d mesh(es), %d guessed from weights" % (
+            r["groups_repositioned"], len(meshes), r["guessed"])
+        if r["stale_groups"]:
+            msg += "; %d still unresolved (see console)" % sum(len(v) for v in r["stale_groups"].values())
+        self.report({"WARNING"} if r["stale_groups"] else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class M2_OT_retarget_pick(Operator):
+    """Fill the pickers from the selection: the armature that owns geoset meshes becomes the M2 rig"""
+    bl_idname = "m2.retarget_pick"
+    bl_label = "Use Selected Armatures"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import retarget as _rt
+        arms = [o for o in context.selected_objects if o.type == "ARMATURE"]
+        if len(arms) != 2:
+            self.report({"ERROR"}, "Select exactly two armatures (%d selected)." % len(arms))
+            return {"CANCELLED"}
+        p = context.scene.m2_retarget
+        a, b = arms
+        if _rt.geoset_meshes(b) and not _rt.geoset_meshes(a):
+            a, b = b, a
+        elif not _rt.geoset_meshes(a) and not _rt.geoset_meshes(b):
+            # Neither has geosets: the active one is the M2I rig.
+            if context.active_object is a:
+                a, b = b, a
+        p.m2_rig, p.other_rig = a, b
+        return {"FINISHED"}
+
+
+class M2_OT_retarget(Operator):
+    """Rename the M2I rig's bones to the M2 names (paired by order), move its meshes onto the M2 rig, and copy each replaced geoset's name, settings, materials and UV sets onto the matching mesh"""
+    bl_idname = "m2.retarget"
+    bl_label = "Retarget"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import retarget as _rt
+        p = context.scene.m2_retarget
+        if p.m2_rig is None or p.other_rig is None:
+            self.report({"ERROR"}, "Pick the M2 rig and the M2I rig first.")
+            return {"CANCELLED"}
+        if p.m2_rig is p.other_rig:
+            self.report({"ERROR"}, "The two rigs must be different armatures.")
+            return {"CANCELLED"}
+        if not _rt.geoset_meshes(p.m2_rig):
+            self.report({"WARNING"}, "%s has no imported geoset meshes; only bones and "
+                        "parenting will be transferred." % p.m2_rig.name)
+        try:
+            r = _rt.retarget(p.m2_rig, p.other_rig, bone_method="ORDER",
+                             bone_distance=p.bone_distance, shape_distance_max=p.shape_distance,
+                             take_names=p.take_names, originals=p.originals,
+                             remove_other=p.remove_other, guess_from_weights=p.guess_from_weights,
+                             mesh_method=p.mesh_method, copy_uvs=p.copy_uvs,
+                             repair_weights=p.repair_weights,
+                             log=lambda s: print(s, flush=True))
+        except _rt.RetargetError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        msg = ("Bones %d matched (%d unmatched), %d vertex groups renamed, %d objects moved, "
+               "%d meshes took over a geoset, %d unmatched, %d UV sets copied, %d stray vertices re-weighted"
+               % (r["bones_matched"], len(r["bones_unmatched"]), r["groups_renamed"], r["moved"],
+                  r["matched"], len(r["unmatched"]), r["uv_sets"], r["weights_repaired"]))
+        if r["stale_groups"]:
+            n = sum(len(v) for v in r["stale_groups"].values())
+            msg += "; %d vertex group(s) on %d mesh(es) still name no M2 bone (see console)" % (n, len(r["stale_groups"]))
+        self.report({"WARNING"} if r["unmatched"] or r["bones_unmatched"] or r["stale_groups"] else {"INFO"}, msg)
+        if r["other_removed"]:
+            p.other_rig = None
+        return {"FINISHED"}
+
+
+class VIEW3D_PT_m2_retarget(_M2PanelBase, Panel):
+    bl_idname = "VIEW3D_PT_m2_retarget"
+    bl_label = "Retarget M2I"
+
+    def draw(self, context):
+        layout = self.layout
+        p = context.scene.m2_retarget
+        col = layout.column(align=True)
+        col.prop(p, "m2_rig")
+        col.prop(p, "other_rig")
+        layout.operator("m2.retarget_pick", icon="RESTRICT_SELECT_OFF")
+        box = layout.box()
+        box.prop(p, "mesh_method")
+        if p.mesh_method in ("AUTO", "SHAPE"):
+            box.prop(p, "shape_distance")
+        box.prop(p, "take_names")
+        box.prop(p, "originals")
+        box.prop(p, "remove_other")
+        box.prop(p, "guess_from_weights")
+        box.prop(p, "copy_uvs")
+        box.prop(p, "repair_weights")
+        row = layout.row()
+        row.scale_y = 1.4
+        row.enabled = p.m2_rig is not None and p.other_rig is not None and p.m2_rig is not p.other_rig
+        row.operator("m2.retarget", icon="ARMATURE_DATA", text="Retarget Meshes onto M2 Rig")
+        row = layout.row()
+        row.enabled = p.m2_rig is not None
+        row.operator("m2.retarget_fix_groups", icon="GROUP_VERTEX")
+
+
 _classes = (
     M2MaterialProps,
     M2GeosetProps,
+    M2RetargetProps,
+    M2_OT_retarget_pick,
+    M2_OT_retarget,
+    M2_OT_retarget_fix_groups,
+    VIEW3D_PT_m2_retarget,
     M2_OT_add_material,
     M2_OT_material_to_selected,
     M2_OT_apply_geoset,
@@ -925,6 +1115,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Material.m2 = PointerProperty(type=M2MaterialProps)
     bpy.types.Scene.m2_geoset = PointerProperty(type=M2GeosetProps)
+    bpy.types.Scene.m2_retarget = PointerProperty(type=M2RetargetProps)
     bpy.msgbus.subscribe_rna(
         key=(bpy.types.LayerObjects, "active"),
         owner=_MSGBUS_OWNER,
@@ -938,6 +1129,7 @@ def unregister():
         bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
     except Exception:  # noqa: BLE001
         pass
+    del bpy.types.Scene.m2_retarget
     del bpy.types.Scene.m2_geoset
     del bpy.types.Material.m2
     for cls in reversed(_classes):
