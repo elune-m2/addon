@@ -116,6 +116,10 @@ def _fcurve_map(action):
     return out
 
 
+def _action_has_keys(action):
+    return any(len(fc.keyframe_points) for fc in _fcurve_map(action).values())
+
+
 def _keyframe_frames(fmap, base, n):
     frames = set()
     for i in range(n):
@@ -341,6 +345,12 @@ def _build_animation_multi(model, arm, ordered, idx, fps, mirror_x, meta):
             s.flags &= ~0x40
             target = i
         s.alias_next = target
+        # An alias with no keys of its own must not claim embedded data
+        # (0x20): the client would play its empty track, i.e. the rest pose,
+        # instead of following alias_next. Retail writes these as 0x40 / 0xc1.
+        if s.flags & 0x40 and not _action_has_keys(action):
+            s.pure_alias = True
+            s.flags &= ~0x20
 
     # seq_lookup maps an animation id to its first sequence; reuse the original
     # when the sequence set came through whole, else rebuild it.
@@ -1552,6 +1562,95 @@ def _build_mesh(model, objects, g2b, mirror_x, specs):
 
 
 # ---------------------------------------------------------------------------
+def _all_tracks(model):
+    """Every per-sequence M2AnimTrack in the model."""
+    for b in model.bones:
+        yield from (t for t in (b.translation, b.rotation, b.scale) if t is not None)
+    for group in (model.colors, model.transforms):
+        for tup in group:
+            yield from (t for t in tup if t is not None)
+    yield from (t for t in model.weights if t is not None)
+    for c in model.cameras:
+        yield from (t for t in (c.position, c.target, c.roll, c.fov) if t is not None)
+
+
+def _materialize_aliases(model, log=print):
+    """Give every alias-only sequence (flag 0x40, no keys) a copy of the keys
+    of the sequence it aliases, and make it a plain embedded sequence.
+
+    Retail resolves these in the client by following alias_next; that works
+    for retail files, but a copy of the keys plays no matter how the client
+    treats the alias flags, so EmoteUseStanding (interacting with an NPC or
+    object) and the NoSheathe emotes always animate. Costs a few KB."""
+    seqs = model.sequences
+    nseq = len(seqs)
+    done = []
+    for i, s in enumerate(seqs):
+        if not getattr(s, "pure_alias", False):
+            continue
+        t, hops = i, 0
+        while seqs[t].flags & 0x40 and hops < 16:
+            nxt = seqs[t].alias_next
+            if not (0 <= nxt < nseq) or nxt == t:
+                break
+            t, hops = nxt, hops + 1
+        if t == i or getattr(seqs[t], "pure_alias", False):
+            continue                     # nothing to copy: stays a retail-style alias
+        for tr in _all_tracks(model):
+            if tr.global_sequence >= 0 or len(tr.timelines) != nseq:
+                continue
+            if not tr.timelines[i] and tr.timelines[t]:
+                tr.timelines[i] = list(tr.timelines[t])
+        for e in model.events:
+            if len(e.timestamps) == nseq and not e.timestamps[i] and e.timestamps[t]:
+                e.timestamps[i] = list(e.timestamps[t])
+        s.flags = (s.flags & ~0x40) | 0x20
+        s.alias_next = i
+        s.pure_alias = False
+        done.append("%d<-%d" % (s.id, seqs[t].id))
+    if done:
+        log("[M2] %d alias sequence(s) given their own copy of the aliased keys: %s"
+            % (len(done), ", ".join(done)))
+
+
+# Movement speed (model units per second) the client divides the character's
+# actual speed by to pace a locomotion clip. Retail sets these on most
+# characters but leaves some at 0 (draenei / blood elf Sprint, older
+# JumpLandRun), which plays the clip at a fixed rate whatever the speed.
+# Values are the ones retail uses where it does set them.
+DEFAULT_MOVESPEED = {
+    4: 2.5,       # Walk
+    13: 2.5,      # Walkbackwards
+    5: 7.0,       # Run
+    143: 11.0,    # Sprint
+    187: "run",   # JumpLandRun: the model's own Run speed
+    990: "run",   # DHCombatRun
+    1012: "run",  # DHCombatSprint
+    1042: "run",  # FelRushLoop
+    119: 2.5,     # StealthWalk
+    223: 5.0,     # StealthRun
+    1150: 2.22,   # WAWalk
+    1160: 2.64,   # WADrunkWalk
+    1162: 2.5,    # WADrunkWalkBackwards
+    1216: 2.22,   # WAWheelBarrowWalk
+    1284: 2.22,   # WABarrelWalk
+}
+
+
+def _fill_movespeed(model, log=print):
+    """Set the movement speed of locomotion sequences that have none."""
+    run = next((s.movespeed for s in model.sequences if s.id == 5 and s.movespeed), 0.0) or 7.0
+    filled = []
+    for s in model.sequences:
+        if s.movespeed or s.id not in DEFAULT_MOVESPEED:
+            continue
+        v = DEFAULT_MOVESPEED[s.id]
+        s.movespeed = float(run if v == "run" else v)
+        filled.append("%s=%.2f" % (names.animation_name(s.id), s.movespeed))
+    if filled:
+        log("[M2] movement speed filled on %d sequence(s): %s" % (len(filled), ", ".join(sorted(set(filled)))))
+
+
 def build_model_from_scene(objects, fps=30, mirror_x=False, texture_file_id=0,
                            name="CustomModel", source_model=None):
     """Construct a complete M2Model from a raw Blender scene."""
@@ -1638,6 +1737,8 @@ def build_model_from_scene(objects, fps=30, mirror_x=False, texture_file_id=0,
     if model.bounding_override:
         print("[M2] using edited bounding box from 'M2_BoundingBox' object",
               flush=True)
+    _materialize_aliases(model)
+    _fill_movespeed(model)
     model.aux_chunks = {}
     model.skin_file_ids = []
     print("[M2] from-scratch: %d sequences, %d attachments, %d textures, "

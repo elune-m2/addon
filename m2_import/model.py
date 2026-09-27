@@ -79,6 +79,7 @@ class M2Sequence:
         "start_timestamp", "end_timestamp",
         "frequency", "variation_next", "alias_next",
         "movespeed", "blend_time_in", "blend_time_out", "bounds",
+        "pure_alias",
     )
 
     def __init__(self):
@@ -94,6 +95,9 @@ class M2Sequence:
         # id, or -1 to end the chain. This links Stand -> Stand_1 -> ...
         self.variation_next = -1
         self.alias_next = 0
+        # True for an alias (flag 0x40) with no keys of its own: written
+        # without 0x20 so the client follows alias_next, as retail does.
+        self.pure_alias = False
         self.movespeed = 0.0
         # Cross-fade (ms) into / out of this animation. 0 makes the client snap
         # between animations; retail uses 150 almost everywhere.

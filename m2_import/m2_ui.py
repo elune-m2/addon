@@ -753,6 +753,28 @@ class VIEW3D_PT_m2_action(_M2PanelBase, Panel):
         else:
             box.label(text="Blend: 150 ms (default)")
             box.operator("m2.action_add_blend_time", icon="ADD")
+        # Movement speed: the client divides the character's real speed by it
+        # to pace the clip (Walk 2.5, Run 7, Sprint 11). 0 = fixed rate.
+        if "m2_seq_movespeed" in act.keys():
+            box.prop(act, '["m2_seq_movespeed"]', text="Move Speed (units/s)")
+        else:
+            box.operator("m2.action_add_movespeed", icon="ADD")
+
+
+class M2_OT_action_add_movespeed(Operator):
+    """Add an editable movement speed to the active action (Walk 2.5, Run 7, Sprint 11; 0 plays at a fixed rate). Locomotion clips left at 0 are filled with retail's values at export"""
+    bl_idname = "m2.action_add_movespeed"
+    bl_label = "Edit Move Speed"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from .from_scene import DEFAULT_MOVESPEED
+        act = _active_action(context.active_object)
+        if act is None:
+            return {"CANCELLED"}
+        v = DEFAULT_MOVESPEED.get(int(act.get("m2_seq_id", -1)), 0.0)
+        act["m2_seq_movespeed"] = 7.0 if v == "run" else float(v)
+        return {"FINISHED"}
 
 
 class M2_OT_action_add_blend_time(Operator):
@@ -1065,6 +1087,7 @@ _classes = (
     M2_OT_sync_geoset_id_from_group_var,
     M2_OT_apply_pose_as_rest_all_actions,
     M2_OT_action_add_blend_time,
+    M2_OT_action_add_movespeed,
     VIEW3D_PT_m2_material,
     VIEW3D_PT_m2_bone,
     VIEW3D_PT_m2_action,

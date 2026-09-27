@@ -184,7 +184,14 @@ def _pack_sequence(s, bounds):
     """``bounds`` is the fallback for a sequence without its own box: the
     rest-pose mesh extents, never the render bounds (which cover every
     animation and would push the character-screen camera far away)."""
-    flags = (s.flags | 0x20) & 0xFFFFFFFF
+    # 0x20 = "this sequence's keys are in this file". Every sequence we write
+    # is embedded, except a pure alias (0x40 with no keys of its own): retail
+    # leaves 0x20 off those, and with it on the client plays the empty
+    # embedded track (rest pose) instead of following alias_next.
+    if getattr(s, "pure_alias", False):
+        flags = (s.flags & ~0x20) & 0xFFFFFFFF
+    else:
+        flags = (s.flags | 0x20) & 0xFFFFFFFF
     (bx0, by0, bz0), (bx1, by1, bz1), radius = getattr(s, "bounds", None) or bounds
     freq = int(getattr(s, "frequency", 0)) & 0xFFFF
     vnext = int(getattr(s, "variation_next", -1))
