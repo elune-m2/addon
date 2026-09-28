@@ -715,6 +715,191 @@ class VIEW3D_PT_m2_bone(_M2PanelBase, Panel):
         row.operator("m2.apply_pose_as_rest_all_actions", icon="POSE_HLT")
 
 
+# ---------------------------------------------------------------------------
+# Bone Adjust: offset bones across every animation.
+def _adjust_arm(context):
+    """The armature to adjust: the active one, or the armature the active
+    object belongs to."""
+    obj = context.active_object
+    if obj is None:
+        return None
+    if obj.type == "ARMATURE":
+        return obj
+    p = obj.parent
+    while p is not None:
+        if p.type == "ARMATURE":
+            return p
+        p = p.parent
+    return None
+
+
+class M2_OT_bone_adjust_start(Operator):
+    """Pause the animation, show the rest pose and switch to pose mode so you can move, rotate or scale bones. Apply then adds the change to every animation"""
+    bl_idname = "m2.bone_adjust_start"
+    bl_label = "Start Adjusting Bones"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import bone_adjust as _ba
+        arm = _adjust_arm(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select the M2 armature (or one of its meshes).")
+            return {"CANCELLED"}
+        _ba.start(arm, context)
+        return {"FINISHED"}
+
+
+class M2_OT_bone_adjust_apply(Operator):
+    """Add every bone's move / rotation / scale to every animation clip, then return to the animation"""
+    bl_idname = "m2.bone_adjust_apply"
+    bl_label = "Apply to All Animations"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import bone_adjust as _ba
+        arm = _adjust_arm(context)
+        if arm is None or not _ba.is_adjusting(arm):
+            self.report({"ERROR"}, "Not adjusting: click Start Adjusting Bones first.")
+            return {"CANCELLED"}
+        offsets = _ba.deltas(arm)
+        if not offsets:
+            _ba.finish(arm, context)
+            self.report({"WARNING"}, "No bone was moved, rotated or scaled; nothing applied.")
+            return {"FINISHED"}
+        r = _ba.bake(arm, offsets, log=lambda s: print(s, flush=True))
+        _ba.finish(arm, context)
+        self.report({"INFO"}, "Applied to %d bone(s) in %d animation(s) (%d keys)."
+                    % (r["bones"], r["actions"], r["keys"]))
+        return {"FINISHED"}
+
+
+class M2_OT_bone_adjust_cancel(Operator):
+    """Throw the bone edits away and return to the animation"""
+    bl_idname = "m2.bone_adjust_cancel"
+    bl_label = "Cancel"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import bone_adjust as _ba
+        arm = _adjust_arm(context)
+        if arm is None or not _ba.is_adjusting(arm):
+            return {"CANCELLED"}
+        _ba.finish(arm, context)
+        return {"FINISHED"}
+
+
+class M2_OT_bone_adjust_reset_selected(Operator):
+    """Put the selected bones back on their rest pose"""
+    bl_idname = "m2.bone_adjust_reset_selected"
+    bl_label = "Reset Selected"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import bone_adjust as _ba
+        arm = _adjust_arm(context)
+        if arm is None:
+            return {"CANCELLED"}
+        for pb in arm.pose.bones:
+            if pb.select or pb == context.active_pose_bone:
+                _ba._reset(pb)
+        return {"FINISHED"}
+
+
+def _attachment_items(self, context):
+    from . import bone_adjust as _ba
+    arm = _adjust_arm(context)
+    items = []
+    for o in (_ba.attachment_empties(arm) if arm else []):
+        label = o.name.split("_attach_", 1)[-1] if "_attach_" in o.name else o.name
+        items.append((o.name, "%s  (%s)" % (label, o.parent_bone), "Select bone %s" % o.parent_bone))
+    return items or [("NONE", "No attachments", "")]
+
+
+class M2_OT_bone_adjust_pick_attachment(Operator):
+    """Select the bone an attachment point sits on (hand, shoulder, sheath...): scaling that bone scales the equipped item"""
+    bl_idname = "m2.bone_adjust_pick_attachment"
+    bl_label = "Select Attachment Bone"
+    bl_options = {"REGISTER", "UNDO"}
+    bl_property = "attachment"
+
+    attachment: EnumProperty(name="Attachment", items=_attachment_items)
+
+    def execute(self, context):
+        arm = _adjust_arm(context)
+        o = bpy.data.objects.get(self.attachment)
+        if arm is None or o is None or o.parent_bone not in arm.data.bones:
+            return {"CANCELLED"}
+        if context.mode != "POSE":
+            if context.view_layer.objects.active is not arm:
+                if context.mode != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                context.view_layer.objects.active = arm
+            bpy.ops.object.mode_set(mode="POSE")
+        for pb in arm.pose.bones:
+            pb.select = False
+        pb = arm.pose.bones[o.parent_bone]
+        pb.select = True
+        arm.data.bones.active = pb.bone
+        return {"FINISHED"}
+
+
+class VIEW3D_PT_m2_bone_adjust(_M2PanelBase, Panel):
+    bl_idname = "VIEW3D_PT_m2_bone_adjust"
+    bl_label = "Bone Adjust"
+
+    def draw(self, context):
+        from . import bone_adjust as _ba
+        layout = self.layout
+        arm = _adjust_arm(context)
+        if arm is None:
+            layout.label(text="Select the M2 armature.", icon="INFO")
+            return
+        if not _ba.is_adjusting(arm):
+            col = layout.column()
+            col.label(text="Move, rotate or scale bones in")
+            col.label(text="every animation at once.")
+            row = layout.row()
+            row.scale_y = 1.3
+            row.operator("m2.bone_adjust_start", icon="POSE_HLT")
+            return
+        box = layout.box()
+        box.label(text="Animation paused on the rest pose.", icon="PAUSE")
+        box.label(text="Edit bones with G / R / S or below.")
+        layout.operator_menu_enum("m2.bone_adjust_pick_attachment", "attachment",
+                                  text="Select Attachment Bone", icon="EMPTY_AXIS")
+        pb = context.active_pose_bone
+        if pb is not None and pb.id_data is arm:
+            b = layout.box()
+            b.label(text=pb.name, icon="BONE_DATA")
+            b.prop(pb, "location")
+            if pb.rotation_mode == "QUATERNION":
+                b.prop(pb, "rotation_quaternion", text="Rotation")
+            else:
+                b.prop(pb, "rotation_euler", text="Rotation")
+            b.prop(pb, "scale")
+        offsets = _ba.deltas(arm)
+        if offsets:
+            b = layout.box()
+            b.label(text="%d bone(s) changed:" % len(offsets))
+            for name, (loc, rot, scl) in list(offsets.items())[:12]:
+                parts = []
+                if loc.length > _ba.EPS:
+                    parts.append("move")
+                if abs(abs(rot.w) - 1.0) > _ba.EPS:
+                    parts.append("rotate")
+                if any(abs(s - 1.0) > _ba.EPS for s in scl):
+                    parts.append("scale %.2f" % (sum(scl) / 3.0))
+                b.label(text="%s: %s" % (name, ", ".join(parts)))
+            if len(offsets) > 12:
+                b.label(text="... and %d more" % (len(offsets) - 12))
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator("m2.bone_adjust_apply", icon="CHECKMARK")
+        row = layout.row(align=True)
+        row.operator("m2.bone_adjust_reset_selected", icon="LOOP_BACK")
+        row.operator("m2.bone_adjust_cancel", icon="CANCEL")
+
+
 class VIEW3D_PT_m2_action(_M2PanelBase, Panel):
     bl_idname = "VIEW3D_PT_m2_action"
     bl_label = "M2 Action"
@@ -1088,8 +1273,14 @@ _classes = (
     M2_OT_apply_pose_as_rest_all_actions,
     M2_OT_action_add_blend_time,
     M2_OT_action_add_movespeed,
+    M2_OT_bone_adjust_start,
+    M2_OT_bone_adjust_apply,
+    M2_OT_bone_adjust_cancel,
+    M2_OT_bone_adjust_reset_selected,
+    M2_OT_bone_adjust_pick_attachment,
     VIEW3D_PT_m2_material,
     VIEW3D_PT_m2_bone,
+    VIEW3D_PT_m2_bone_adjust,
     VIEW3D_PT_m2_action,
     VIEW3D_PT_m2_geoset,
 )
